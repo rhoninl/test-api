@@ -1,132 +1,120 @@
 import os
 import json
-from functools import wraps
-from urllib.parse import urlencode
-from flask import Flask, request, Response, jsonify, stream_with_context
 import requests
+from flask import Flask, request, Response, jsonify, stream_with_context
+from functools import wraps
 
-# Environment variable configuration
-DEVICE_HOST = os.environ.get('DEVICE_HOST', '127.0.0.1')
-DEVICE_PORT = os.environ.get('DEVICE_PORT', '8000')
-DEVICE_PROTOCOL = os.environ.get('DEVICE_PROTOCOL', 'http')  # http or https
-
+# Environment Variable Configuration
+DEVICE_BASE_URL = os.environ.get('DEVICE_BASE_URL')  # e.g., http://192.168.1.10:8080
 SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.environ.get('SERVER_PORT', '5000'))
+SERVER_PORT = int(os.environ.get('SERVER_PORT', 8088))
+HTTP_PORT = int(os.environ.get('HTTP_PORT', SERVER_PORT))  # Only HTTP used in this driver
 
-# Device base URL construction
-DEVICE_BASE_URL = f"{DEVICE_PROTOCOL}://{DEVICE_HOST}:{DEVICE_PORT}"
+if not DEVICE_BASE_URL:
+    raise EnvironmentError("DEVICE_BASE_URL environment variable must be set.")
 
-# Flask app initialization
 app = Flask(__name__)
 
+def get_auth_header():
+    auth_header = request.headers.get('Authorization')
+    if auth_header:
+        return {'Authorization': auth_header}
+    return {}
+
+def proxy_request(method, path, data=None, params=None, headers=None, stream=False):
+    url = DEVICE_BASE_URL.rstrip('/') + path
+    headers = headers or {}
+    resp = requests.request(
+        method=method,
+        url=url,
+        params=params,
+        json=data,
+        headers=headers,
+        stream=stream,
+        timeout=30
+    )
+    return resp
+
 def require_auth(f):
-    """Decorator to require Authorization header with Bearer token for certain endpoints."""
     @wraps(f)
     def decorated(*args, **kwargs):
-        auth_header = request.headers.get('Authorization')
-        if not auth_header or not auth_header.startswith('Bearer '):
-            return jsonify({'error': 'Unauthorized'}), 401
+        if not request.headers.get('Authorization'):
+            return jsonify({'error': 'Missing Authorization header'}), 401
         return f(*args, **kwargs)
     return decorated
 
-# Helper function to extract token from Authorization header
-def get_token():
-    auth_header = request.headers.get('Authorization')
-    if auth_header and auth_header.startswith('Bearer '):
-        return auth_header.split(' ', 1)[1]
-    return None
-
-# Session: Login
 @app.route('/session/login', methods=['POST'])
 def session_login():
-    payload = request.get_json(force=True)
-    url = f"{DEVICE_BASE_URL}/session/login"
-    resp = requests.post(url, json=payload)
+    data = request.get_json(force=True)
+    resp = proxy_request('POST', '/session/login', data=data)
     return (resp.content, resp.status_code, resp.headers.items())
 
-# Session: Logout
 @app.route('/session/logout', methods=['POST'])
 @require_auth
 def session_logout():
-    url = f"{DEVICE_BASE_URL}/session/logout"
-    token = get_token()
-    headers = {'Authorization': f'Bearer {token}'}
-    resp = requests.post(url, headers=headers)
+    headers = get_auth_header()
+    resp = proxy_request('POST', '/session/logout', headers=headers)
     return (resp.content, resp.status_code, resp.headers.items())
 
-# Schedules: List tasks
-@app.route('/schedules', methods=['GET'])
+@app.route('/schedules', methods=['GET', 'POST'])
 @require_auth
-def get_schedules():
-    url = f"{DEVICE_BASE_URL}/schedules"
-    token = get_token()
-    headers = {'Authorization': f'Bearer {token}'}
-    resp = requests.get(url, headers=headers)
-    return (resp.content, resp.status_code, resp.headers.items())
+def schedules():
+    headers = get_auth_header()
+    if request.method == 'GET':
+        resp = proxy_request('GET', '/schedules', headers=headers)
+        return (resp.content, resp.status_code, resp.headers.items())
+    else:
+        data = request.get_json(force=True)
+        resp = proxy_request('POST', '/schedules', data=data, headers=headers)
+        return (resp.content, resp.status_code, resp.headers.items())
 
-# Schedules: Create task
-@app.route('/schedules', methods=['POST'])
+@app.route('/posts', methods=['GET', 'POST'])
 @require_auth
-def post_schedule():
-    payload = request.get_json(force=True)
-    url = f"{DEVICE_BASE_URL}/schedules"
-    token = get_token()
-    headers = {'Authorization': f'Bearer {token}'}
-    resp = requests.post(url, json=payload, headers=headers)
-    return (resp.content, resp.status_code, resp.headers.items())
+def posts():
+    headers = get_auth_header()
+    if request.method == 'GET':
+        params = request.args.to_dict(flat=True)
+        resp = proxy_request('GET', '/posts', params=params, headers=headers)
+        return (resp.content, resp.status_code, resp.headers.items())
+    else:
+        data = request.get_json(force=True)
+        resp = proxy_request('POST', '/posts', data=data, headers=headers)
+        return (resp.content, resp.status_code, resp.headers.items())
 
-# Posts: List posts (with query params)
-@app.route('/posts', methods=['GET'])
-@require_auth
-def get_posts():
-    url = f"{DEVICE_BASE_URL}/posts"
-    token = get_token()
-    headers = {'Authorization': f'Bearer {token}'}
-    # Forward all query params
-    resp = requests.get(url, headers=headers, params=request.args)
-    return (resp.content, resp.status_code, resp.headers.items())
-
-# Posts: Create post
-@app.route('/posts', methods=['POST'])
-@require_auth
-def post_post():
-    payload = request.get_json(force=True)
-    url = f"{DEVICE_BASE_URL}/posts"
-    token = get_token()
-    headers = {'Authorization': f'Bearer {token}'}
-    resp = requests.post(url, json=payload, headers=headers)
-    return (resp.content, resp.status_code, resp.headers.items())
-
-# Search endpoint (with query param)
 @app.route('/search', methods=['GET'])
 @require_auth
 def search():
-    url = f"{DEVICE_BASE_URL}/search"
-    token = get_token()
-    headers = {'Authorization': f'Bearer {token}'}
-    resp = requests.get(url, headers=headers, params=request.args)
+    headers = get_auth_header()
+    params = request.args.to_dict(flat=True)
+    resp = proxy_request('GET', '/search', params=params, headers=headers)
     return (resp.content, resp.status_code, resp.headers.items())
 
-# Chat: Get messages for chatId
-@app.route('/chats/<chatId>/messages', methods=['GET'])
+@app.route('/chats/<chat_id>/messages', methods=['GET', 'POST'])
 @require_auth
-def get_chat_messages(chatId):
-    url = f"{DEVICE_BASE_URL}/chats/{chatId}/messages"
-    token = get_token()
-    headers = {'Authorization': f'Bearer {token}'}
-    resp = requests.get(url, headers=headers)
-    return (resp.content, resp.status_code, resp.headers.items())
+def chat_messages(chat_id):
+    headers = get_auth_header()
+    device_path = f'/chats/{chat_id}/messages'
+    if request.method == 'GET':
+        resp = proxy_request('GET', device_path, headers=headers)
+        return (resp.content, resp.status_code, resp.headers.items())
+    else:
+        data = request.get_json(force=True)
+        resp = proxy_request('POST', device_path, data=data, headers=headers)
+        return (resp.content, resp.status_code, resp.headers.items())
 
-# Chat: Post message to chatId
-@app.route('/chats/<chatId>/messages', methods=['POST'])
-@require_auth
-def post_chat_message(chatId):
-    payload = request.get_json(force=True)
-    url = f"{DEVICE_BASE_URL}/chats/{chatId}/messages"
-    token = get_token()
-    headers = {'Authorization': f'Bearer {token}'}
-    resp = requests.post(url, json=payload, headers=headers)
-    return (resp.content, resp.status_code, resp.headers.items())
+@app.route('/')
+def index():
+    return jsonify({
+        'service': 'GoSchedule, ChatToChat, Bustub HTTP Proxy Driver',
+        'endpoints': [
+            {'method': 'POST', 'path': '/session/login'},
+            {'method': 'POST', 'path': '/session/logout'},
+            {'method': 'GET/POST', 'path': '/schedules'},
+            {'method': 'GET/POST', 'path': '/posts'},
+            {'method': 'GET', 'path': '/search'},
+            {'method': 'GET/POST', 'path': '/chats/<chatId>/messages'}
+        ]
+    })
 
 if __name__ == '__main__':
-    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
+    app.run(host=SERVER_HOST, port=HTTP_PORT)
