@@ -1,120 +1,116 @@
 import os
 import json
-import requests
-from flask import Flask, request, Response, jsonify, stream_with_context
+from urllib.parse import urlencode
 from functools import wraps
 
-# Environment Variable Configuration
-DEVICE_BASE_URL = os.environ.get('DEVICE_BASE_URL')  # e.g., http://192.168.1.10:8080
-SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.environ.get('SERVER_PORT', 8088))
-HTTP_PORT = int(os.environ.get('HTTP_PORT', SERVER_PORT))  # Only HTTP used in this driver
-
-if not DEVICE_BASE_URL:
-    raise EnvironmentError("DEVICE_BASE_URL environment variable must be set.")
+from flask import Flask, request, Response, jsonify, stream_with_context
+import requests
 
 app = Flask(__name__)
 
-def get_auth_header():
-    auth_header = request.headers.get('Authorization')
-    if auth_header:
-        return {'Authorization': auth_header}
-    return {}
+# Environment Variable Configuration
+DEVICE_HOST = os.environ.get("DEVICE_HOST", "localhost")
+DEVICE_PORT = os.environ.get("DEVICE_PORT", "8000")
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "5000"))
+DEVICE_PROTOCOL = os.environ.get("DEVICE_PROTOCOL", "http")  # http or https
 
-def proxy_request(method, path, data=None, params=None, headers=None, stream=False):
-    url = DEVICE_BASE_URL.rstrip('/') + path
-    headers = headers or {}
-    resp = requests.request(
-        method=method,
-        url=url,
-        params=params,
-        json=data,
-        headers=headers,
-        stream=stream,
-        timeout=30
-    )
-    return resp
+DEVICE_BASE = f"{DEVICE_PROTOCOL}://{DEVICE_HOST}:{DEVICE_PORT}"
 
-def require_auth(f):
-    @wraps(f)
-    def decorated(*args, **kwargs):
-        if not request.headers.get('Authorization'):
-            return jsonify({'error': 'Missing Authorization header'}), 401
-        return f(*args, **kwargs)
-    return decorated
+# Helper: Proxy request to device, stream response if wanted
+def proxy_request(method, path, stream=False, token=None, data=None, params=None, headers=None):
+    url = DEVICE_BASE + path
+    req_headers = dict(headers) if headers else {}
+    if token:
+        req_headers['Authorization'] = f"Bearer {token}"
+    payload = None
+    if data:
+        payload = json.dumps(data)
+        req_headers['Content-Type'] = 'application/json'
+    resp = requests.request(method, url, headers=req_headers, params=params, data=payload, stream=stream)
+    if stream:
+        def generate():
+            for chunk in resp.iter_content(chunk_size=4096):
+                if chunk:
+                    yield chunk
+        return Response(stream_with_context(generate()), status=resp.status_code, content_type=resp.headers.get('Content-Type'))
+    else:
+        return Response(resp.content, status=resp.status_code, content_type=resp.headers.get('Content-Type'))
 
+# Decorator to extract token from Authorization header
+def require_token(fn):
+    @wraps(fn)
+    def wrapper(*args, **kwargs):
+        auth = request.headers.get('Authorization', '')
+        token = None
+        if auth.startswith('Bearer '):
+            token = auth.split(' ', 1)[1]
+        return fn(token, *args, **kwargs)
+    return wrapper
+
+# 1. POST /session/login
 @app.route('/session/login', methods=['POST'])
 def session_login():
     data = request.get_json(force=True)
-    resp = proxy_request('POST', '/session/login', data=data)
-    return (resp.content, resp.status_code, resp.headers.items())
+    return proxy_request('POST', '/session/login', data=data)
 
+# 2. POST /session/logout
 @app.route('/session/logout', methods=['POST'])
-@require_auth
-def session_logout():
-    headers = get_auth_header()
-    resp = proxy_request('POST', '/session/logout', headers=headers)
-    return (resp.content, resp.status_code, resp.headers.items())
+@require_token
+def session_logout(token):
+    return proxy_request('POST', '/session/logout', token=token)
 
-@app.route('/schedules', methods=['GET', 'POST'])
-@require_auth
-def schedules():
-    headers = get_auth_header()
-    if request.method == 'GET':
-        resp = proxy_request('GET', '/schedules', headers=headers)
-        return (resp.content, resp.status_code, resp.headers.items())
-    else:
-        data = request.get_json(force=True)
-        resp = proxy_request('POST', '/schedules', data=data, headers=headers)
-        return (resp.content, resp.status_code, resp.headers.items())
+# 3. GET /schedules
+@app.route('/schedules', methods=['GET'])
+@require_token
+def get_schedules(token):
+    return proxy_request('GET', '/schedules', token=token, params=request.args)
 
-@app.route('/posts', methods=['GET', 'POST'])
-@require_auth
-def posts():
-    headers = get_auth_header()
-    if request.method == 'GET':
-        params = request.args.to_dict(flat=True)
-        resp = proxy_request('GET', '/posts', params=params, headers=headers)
-        return (resp.content, resp.status_code, resp.headers.items())
-    else:
-        data = request.get_json(force=True)
-        resp = proxy_request('POST', '/posts', data=data, headers=headers)
-        return (resp.content, resp.status_code, resp.headers.items())
+# 4. POST /schedules
+@app.route('/schedules', methods=['POST'])
+@require_token
+def post_schedules(token):
+    data = request.get_json(force=True)
+    return proxy_request('POST', '/schedules', token=token, data=data)
 
+# 5. GET /posts
+@app.route('/posts', methods=['GET'])
+@require_token
+def get_posts(token):
+    return proxy_request('GET', '/posts', token=token, params=request.args)
+
+# 6. POST /posts
+@app.route('/posts', methods=['POST'])
+@require_token
+def post_posts(token):
+    data = request.get_json(force=True)
+    return proxy_request('POST', '/posts', token=token, data=data)
+
+# 7. GET /search
 @app.route('/search', methods=['GET'])
-@require_auth
-def search():
-    headers = get_auth_header()
-    params = request.args.to_dict(flat=True)
-    resp = proxy_request('GET', '/search', params=params, headers=headers)
-    return (resp.content, resp.status_code, resp.headers.items())
+@require_token
+def get_search(token):
+    return proxy_request('GET', '/search', token=token, params=request.args)
 
-@app.route('/chats/<chat_id>/messages', methods=['GET', 'POST'])
-@require_auth
-def chat_messages(chat_id):
-    headers = get_auth_header()
-    device_path = f'/chats/{chat_id}/messages'
-    if request.method == 'GET':
-        resp = proxy_request('GET', device_path, headers=headers)
-        return (resp.content, resp.status_code, resp.headers.items())
-    else:
-        data = request.get_json(force=True)
-        resp = proxy_request('POST', device_path, data=data, headers=headers)
-        return (resp.content, resp.status_code, resp.headers.items())
+# 8. GET /chats/<chatId>/messages
+@app.route('/chats/<chatId>/messages', methods=['GET'])
+@require_token
+def get_chat_messages(token, chatId):
+    path = f"/chats/{chatId}/messages"
+    return proxy_request('GET', path, token=token, params=request.args)
 
-@app.route('/')
-def index():
-    return jsonify({
-        'service': 'GoSchedule, ChatToChat, Bustub HTTP Proxy Driver',
-        'endpoints': [
-            {'method': 'POST', 'path': '/session/login'},
-            {'method': 'POST', 'path': '/session/logout'},
-            {'method': 'GET/POST', 'path': '/schedules'},
-            {'method': 'GET/POST', 'path': '/posts'},
-            {'method': 'GET', 'path': '/search'},
-            {'method': 'GET/POST', 'path': '/chats/<chatId>/messages'}
-        ]
-    })
+# 9. POST /chats/<chatId>/messages
+@app.route('/chats/<chatId>/messages', methods=['POST'])
+@require_token
+def post_chat_messages(token, chatId):
+    data = request.get_json(force=True)
+    path = f"/chats/{chatId}/messages"
+    return proxy_request('POST', path, token=token, data=data)
 
-if __name__ == '__main__':
-    app.run(host=SERVER_HOST, port=HTTP_PORT)
+# Health check
+@app.route('/', methods=['GET'])
+def health():
+    return jsonify({"status": "GoSchedule driver running"})
+
+if __name__ == "__main__":
+    app.run(host=SERVER_HOST, port=SERVER_PORT)
