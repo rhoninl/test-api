@@ -1,141 +1,185 @@
 import os
 import json
 import asyncio
-import uvicorn
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException, status, Depends
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
-import httpx
+from functools import wraps
+from urllib.parse import urlencode
 
-# Environment variables for configuration
-DEVICE_HTTP_HOST = os.getenv('DEVICE_HTTP_HOST', '127.0.0.1')
-DEVICE_HTTP_PORT = int(os.getenv('DEVICE_HTTP_PORT', '8000'))
-DEVICE_API_BASE = os.getenv('DEVICE_API_BASE', 'http://127.0.0.1:9000')
-DEVICE_WS_BASE = os.getenv('DEVICE_WS_BASE', 'ws://127.0.0.1:9001')
-DEVICE_API_TIMEOUT = int(os.getenv('DEVICE_API_TIMEOUT', '10'))
+from aiohttp import web, ClientSession, WSMsgType
 
-# FastAPI app
-app = FastAPI()
+# === Configuration from environment ===
+DEVICE_BASE_URL = os.environ.get("DEVICE_BASE_URL", "http://localhost:8000")
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
 
-# Enable CORS if needed for browser access
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Utility: Forward REST API request to backend
-async def forward_api_request(method, path, headers=None, params=None, data=None, json_body=None):
-    url = DEVICE_API_BASE + path
-    async with httpx.AsyncClient(timeout=DEVICE_API_TIMEOUT) as client:
-        req_headers = dict(headers or {})
-        if 'host' in req_headers:
-            req_headers.pop('host')
-        response = await client.request(
-            method=method,
-            url=url,
-            headers=req_headers,
-            params=params,
-            data=data,
-            json=json_body
-        )
-        return JSONResponse(
-            status_code=response.status_code,
-            content=response.json() if response.headers.get("content-type", "").startswith("application/json") else response.text
-        )
-
-# 1. Authenticate a user (login)
-@app.post("/session/login")
-async def api_session_login(request: Request):
-    body = await request.json()
-    return await forward_api_request('POST', '/session/login', headers=request.headers, json_body=body)
-
-# 2. Invalidate session token (logout)
-@app.post("/session/logout")
-async def api_session_logout(request: Request):
+# === Utility: Pass-through headers ===
+def extract_auth_header(request):
     auth = request.headers.get("Authorization")
-    if not auth:
-        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing Authorization header")
-    return await forward_api_request('POST', '/session/logout', headers=request.headers)
+    return {"Authorization": auth} if auth else {}
 
-# 3. Fetch scheduled tasks
-@app.get("/schedules")
-async def api_get_schedules(request: Request):
-    return await forward_api_request('GET', '/schedules', headers=request.headers, params=dict(request.query_params))
+def require_auth(f):
+    @wraps(f)
+    async def wrapper(request):
+        if "Authorization" not in request.headers:
+            return web.json_response({"error": "Authorization header required"}, status=401)
+        return await f(request)
+    return wrapper
 
-# 4. Create new task
-@app.post("/schedules")
-async def api_create_schedule(request: Request):
-    body = await request.json()
-    return await forward_api_request('POST', '/schedules', headers=request.headers, json_body=body)
+# === Session token manager (for browser use) ===
+async def set_session_cookie(resp, token):
+    resp.set_cookie("session_token", token, httponly=True, path="/")
 
-# 5. Retrieve recent posts
-@app.get("/posts")
-async def api_get_posts(request: Request):
-    return await forward_api_request('GET', '/posts', headers=request.headers, params=dict(request.query_params))
+def get_session_token(request):
+    token = request.headers.get("Authorization")
+    if not token:
+        token = request.cookies.get("session_token")
+        if token:
+            token = f"Bearer {token}"
+    return token
 
-# 6. Submit new post
-@app.post("/posts")
-async def api_create_post(request: Request):
-    body = await request.json()
-    return await forward_api_request('POST', '/posts', headers=request.headers, json_body=body)
+# === API Proxy Handlers ===
 
-# 7. Global search
-@app.get("/search")
-async def api_search(request: Request):
-    return await forward_api_request('GET', '/search', headers=request.headers, params=dict(request.query_params))
+async def login(request):
+    data = await request.json()
+    async with ClientSession() as session:
+        async with session.post(f"{DEVICE_BASE_URL}/session/login", json=data) as resp:
+            raw = await resp.json()
+            if resp.status == 200 and "token" in raw:
+                response = web.json_response(raw)
+                await set_session_cookie(response, raw["token"])
+                return response
+            return web.json_response(raw, status=resp.status)
 
-# 8. Load message history for a chat
-@app.get("/chats/{chatId}/messages")
-async def api_get_chat_messages(chatId: str, request: Request):
-    path = f"/chats/{chatId}/messages"
-    return await forward_api_request('GET', path, headers=request.headers, params=dict(request.query_params))
+@require_auth
+async def logout(request):
+    token = get_session_token(request)
+    headers = {"Authorization": token}
+    async with ClientSession() as session:
+        async with session.post(f"{DEVICE_BASE_URL}/session/logout", headers=headers) as resp:
+            raw = await resp.json()
+            response = web.json_response(raw, status=resp.status)
+            response.del_cookie("session_token")
+            return response
 
-# 9. Send a new chat message
-@app.post("/chats/{chatId}/messages")
-async def api_post_chat_message(chatId: str, request: Request):
-    path = f"/chats/{chatId}/messages"
-    body = await request.json()
-    return await forward_api_request('POST', path, headers=request.headers, json_body=body)
+@require_auth
+async def get_schedules(request):
+    token = get_session_token(request)
+    headers = {"Authorization": token}
+    async with ClientSession() as session:
+        async with session.get(f"{DEVICE_BASE_URL}/schedules", headers=headers) as resp:
+            raw = await resp.json()
+            return web.json_response(raw, status=resp.status)
 
-# WebSocket proxy: Proxy client <-> backend WebSocket stream
-@app.websocket("/ws/proxy/{path:path}")
-async def websocket_proxy(websocket: WebSocket, path: str):
-    # Accept client WebSocket connection
-    await websocket.accept()
-    backend_ws_url = DEVICE_WS_BASE.rstrip('/') + '/' + path
-    try:
-        async with httpx.AsyncClient() as client:
-            async with client.websocket_connect(backend_ws_url) as backend_ws:
-                async def client_to_backend():
-                    try:
-                        while True:
-                            msg = await websocket.receive_text()
-                            await backend_ws.send_text(msg)
-                    except WebSocketDisconnect:
-                        await backend_ws.aclose()
-                    except Exception:
-                        pass
+@require_auth
+async def post_schedules(request):
+    token = get_session_token(request)
+    data = await request.json()
+    headers = {"Authorization": token}
+    async with ClientSession() as session:
+        async with session.post(f"{DEVICE_BASE_URL}/schedules", json=data, headers=headers) as resp:
+            raw = await resp.json()
+            return web.json_response(raw, status=resp.status)
 
-                async def backend_to_client():
-                    try:
-                        while True:
-                            msg = await backend_ws.receive_text()
-                            await websocket.send_text(msg)
-                    except Exception:
-                        await websocket.close()
+@require_auth
+async def get_posts(request):
+    token = get_session_token(request)
+    params = request.rel_url.query
+    headers = {"Authorization": token}
+    url = f"{DEVICE_BASE_URL}/posts"
+    if params:
+        url += "?" + urlencode(params)
+    async with ClientSession() as session:
+        async with session.get(url, headers=headers) as resp:
+            raw = await resp.json()
+            return web.json_response(raw, status=resp.status)
 
-                await asyncio.gather(client_to_backend(), backend_to_client())
-    except Exception:
-        await websocket.close(code=1001)
+@require_auth
+async def post_posts(request):
+    token = get_session_token(request)
+    data = await request.json()
+    headers = {"Authorization": token}
+    async with ClientSession() as session:
+        async with session.post(f"{DEVICE_BASE_URL}/posts", json=data, headers=headers) as resp:
+            raw = await resp.json()
+            return web.json_response(raw, status=resp.status)
+
+@require_auth
+async def search(request):
+    token = get_session_token(request)
+    params = request.rel_url.query
+    headers = {"Authorization": token}
+    url = f"{DEVICE_BASE_URL}/search"
+    if params:
+        url += "?" + urlencode(params)
+    async with ClientSession() as session:
+        async with session.get(url, headers=headers) as resp:
+            raw = await resp.json()
+            return web.json_response(raw, status=resp.status)
+
+@require_auth
+async def get_chat_messages(request):
+    token = get_session_token(request)
+    chat_id = request.match_info['chatId']
+    headers = {"Authorization": token}
+    async with ClientSession() as session:
+        async with session.get(f"{DEVICE_BASE_URL}/chats/{chat_id}/messages", headers=headers) as resp:
+            raw = await resp.json()
+            return web.json_response(raw, status=resp.status)
+
+@require_auth
+async def post_chat_messages(request):
+    token = get_session_token(request)
+    chat_id = request.match_info['chatId']
+    data = await request.json()
+    headers = {"Authorization": token}
+    async with ClientSession() as session:
+        async with session.post(f"{DEVICE_BASE_URL}/chats/{chat_id}/messages", json=data, headers=headers) as resp:
+            raw = await resp.json()
+            return web.json_response(raw, status=resp.status)
+
+# === WebSocket Proxy Handler ===
+
+async def websocket_handler(request):
+    ws_server = web.WebSocketResponse()
+    await ws_server.prepare(request)
+    token = get_session_token(request)
+    ws_url = f"{DEVICE_BASE_URL.replace('http', 'ws')}/ws"
+    headers = {}
+    if token:
+        headers["Authorization"] = token
+
+    async with ClientSession() as session:
+        async with session.ws_connect(ws_url, headers=headers) as ws_client:
+            async def ws_forward(ws_from, ws_to):
+                async for msg in ws_from:
+                    if msg.type == WSMsgType.TEXT:
+                        await ws_to.send_str(msg.data)
+                    elif msg.type == WSMsgType.BINARY:
+                        await ws_to.send_bytes(msg.data)
+                    elif msg.type == WSMsgType.CLOSE:
+                        await ws_to.close()
+                        break
+
+            await asyncio.gather(
+                ws_forward(ws_server, ws_client),
+                ws_forward(ws_client, ws_server)
+            )
+    return ws_server
+
+# === App setup ===
+
+app = web.Application()
+app.add_routes([
+    web.post('/session/login', login),
+    web.post('/session/logout', logout),
+    web.get('/schedules', get_schedules),
+    web.post('/schedules', post_schedules),
+    web.get('/posts', get_posts),
+    web.post('/posts', post_posts),
+    web.get('/search', search),
+    web.get('/chats/{chatId}/messages', get_chat_messages),
+    web.post('/chats/{chatId}/messages', post_chat_messages),
+    web.get('/ws', websocket_handler)
+])
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host=DEVICE_HTTP_HOST,
-        port=DEVICE_HTTP_PORT,
-        reload=False,
-        access_log=True
-    )
+    web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
