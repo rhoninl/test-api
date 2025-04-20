@@ -1,185 +1,149 @@
 import os
 import json
-import asyncio
-from functools import wraps
 from urllib.parse import urlencode
+from functools import wraps
 
-from aiohttp import web, ClientSession, WSMsgType
+from flask import Flask, request, Response, jsonify, stream_with_context
+import requests
 
-# === Configuration from environment ===
-DEVICE_BASE_URL = os.environ.get("DEVICE_BASE_URL", "http://localhost:8000")
-SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
+# Environment variables for configuration
+DEVICE_URL = os.environ.get('DEVICE_URL', 'http://localhost:8000')
+SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
+SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
 
-# === Utility: Pass-through headers ===
-def extract_auth_header(request):
-    auth = request.headers.get("Authorization")
-    return {"Authorization": auth} if auth else {}
+# Flask HTTP server
+app = Flask(__name__)
+
+def get_token_from_headers():
+    auth = request.headers.get('Authorization')
+    if auth and auth.lower().startswith('bearer '):
+        return auth[7:]
+    return None
 
 def require_auth(f):
     @wraps(f)
-    async def wrapper(request):
-        if "Authorization" not in request.headers:
-            return web.json_response({"error": "Authorization header required"}, status=401)
-        return await f(request)
-    return wrapper
+    def decorated(*args, **kwargs):
+        token = get_token_from_headers()
+        if not token:
+            return jsonify({'error': 'Missing or invalid Authorization header'}), 401
+        return f(token, *args, **kwargs)
+    return decorated
 
-# === Session token manager (for browser use) ===
-async def set_session_cookie(resp, token):
-    resp.set_cookie("session_token", token, httponly=True, path="/")
+# 1. POST /session/login
+@app.route('/session/login', methods=['POST'])
+def session_login():
+    try:
+        data = request.get_json(force=True)
+        r = requests.post(f'{DEVICE_URL}/session/login', json=data)
+        return (r.content, r.status_code, r.headers.items())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-def get_session_token(request):
-    token = request.headers.get("Authorization")
-    if not token:
-        token = request.cookies.get("session_token")
-        if token:
-            token = f"Bearer {token}"
-    return token
-
-# === API Proxy Handlers ===
-
-async def login(request):
-    data = await request.json()
-    async with ClientSession() as session:
-        async with session.post(f"{DEVICE_BASE_URL}/session/login", json=data) as resp:
-            raw = await resp.json()
-            if resp.status == 200 and "token" in raw:
-                response = web.json_response(raw)
-                await set_session_cookie(response, raw["token"])
-                return response
-            return web.json_response(raw, status=resp.status)
-
+# 2. POST /session/logout
+@app.route('/session/logout', methods=['POST'])
 @require_auth
-async def logout(request):
-    token = get_session_token(request)
-    headers = {"Authorization": token}
-    async with ClientSession() as session:
-        async with session.post(f"{DEVICE_BASE_URL}/session/logout", headers=headers) as resp:
-            raw = await resp.json()
-            response = web.json_response(raw, status=resp.status)
-            response.del_cookie("session_token")
-            return response
+def session_logout(token):
+    try:
+        headers = {'Authorization': f'Bearer {token}'}
+        r = requests.post(f'{DEVICE_URL}/session/logout', headers=headers)
+        return (r.content, r.status_code, r.headers.items())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
+# 3. GET /schedules
+@app.route('/schedules', methods=['GET'])
 @require_auth
-async def get_schedules(request):
-    token = get_session_token(request)
-    headers = {"Authorization": token}
-    async with ClientSession() as session:
-        async with session.get(f"{DEVICE_BASE_URL}/schedules", headers=headers) as resp:
-            raw = await resp.json()
-            return web.json_response(raw, status=resp.status)
+def get_schedules(token):
+    try:
+        headers = {'Authorization': f'Bearer {token}'}
+        r = requests.get(f'{DEVICE_URL}/schedules', headers=headers)
+        return (r.content, r.status_code, r.headers.items())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
+# 4. POST /schedules
+@app.route('/schedules', methods=['POST'])
 @require_auth
-async def post_schedules(request):
-    token = get_session_token(request)
-    data = await request.json()
-    headers = {"Authorization": token}
-    async with ClientSession() as session:
-        async with session.post(f"{DEVICE_BASE_URL}/schedules", json=data, headers=headers) as resp:
-            raw = await resp.json()
-            return web.json_response(raw, status=resp.status)
+def post_schedules(token):
+    try:
+        headers = {'Authorization': f'Bearer {token}'}
+        data = request.get_json(force=True)
+        r = requests.post(f'{DEVICE_URL}/schedules', headers=headers, json=data)
+        return (r.content, r.status_code, r.headers.items())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
+# 5. GET /posts
+@app.route('/posts', methods=['GET'])
 @require_auth
-async def get_posts(request):
-    token = get_session_token(request)
-    params = request.rel_url.query
-    headers = {"Authorization": token}
-    url = f"{DEVICE_BASE_URL}/posts"
-    if params:
-        url += "?" + urlencode(params)
-    async with ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            raw = await resp.json()
-            return web.json_response(raw, status=resp.status)
+def get_posts(token):
+    try:
+        headers = {'Authorization': f'Bearer {token}'}
+        query = request.query_string.decode()
+        url = f'{DEVICE_URL}/posts'
+        if query:
+            url += '?' + query
+        r = requests.get(url, headers=headers)
+        return (r.content, r.status_code, r.headers.items())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
+# 6. POST /posts
+@app.route('/posts', methods=['POST'])
 @require_auth
-async def post_posts(request):
-    token = get_session_token(request)
-    data = await request.json()
-    headers = {"Authorization": token}
-    async with ClientSession() as session:
-        async with session.post(f"{DEVICE_BASE_URL}/posts", json=data, headers=headers) as resp:
-            raw = await resp.json()
-            return web.json_response(raw, status=resp.status)
+def post_posts(token):
+    try:
+        headers = {'Authorization': f'Bearer {token}'}
+        data = request.get_json(force=True)
+        r = requests.post(f'{DEVICE_URL}/posts', headers=headers, json=data)
+        return (r.content, r.status_code, r.headers.items())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
+# 7. GET /search
+@app.route('/search', methods=['GET'])
 @require_auth
-async def search(request):
-    token = get_session_token(request)
-    params = request.rel_url.query
-    headers = {"Authorization": token}
-    url = f"{DEVICE_BASE_URL}/search"
-    if params:
-        url += "?" + urlencode(params)
-    async with ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            raw = await resp.json()
-            return web.json_response(raw, status=resp.status)
+def get_search(token):
+    try:
+        headers = {'Authorization': f'Bearer {token}'}
+        query = request.query_string.decode()
+        url = f'{DEVICE_URL}/search'
+        if query:
+            url += '?' + query
+        r = requests.get(url, headers=headers)
+        return (r.content, r.status_code, r.headers.items())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
+# 8. GET /chats/<chatId>/messages
+@app.route('/chats/<chatId>/messages', methods=['GET'])
 @require_auth
-async def get_chat_messages(request):
-    token = get_session_token(request)
-    chat_id = request.match_info['chatId']
-    headers = {"Authorization": token}
-    async with ClientSession() as session:
-        async with session.get(f"{DEVICE_BASE_URL}/chats/{chat_id}/messages", headers=headers) as resp:
-            raw = await resp.json()
-            return web.json_response(raw, status=resp.status)
+def get_chat_messages(token, chatId):
+    try:
+        headers = {'Authorization': f'Bearer {token}'}
+        url = f'{DEVICE_URL}/chats/{chatId}/messages'
+        r = requests.get(url, headers=headers)
+        return (r.content, r.status_code, r.headers.items())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
+# 9. POST /chats/<chatId>/messages
+@app.route('/chats/<chatId>/messages', methods=['POST'])
 @require_auth
-async def post_chat_messages(request):
-    token = get_session_token(request)
-    chat_id = request.match_info['chatId']
-    data = await request.json()
-    headers = {"Authorization": token}
-    async with ClientSession() as session:
-        async with session.post(f"{DEVICE_BASE_URL}/chats/{chat_id}/messages", json=data, headers=headers) as resp:
-            raw = await resp.json()
-            return web.json_response(raw, status=resp.status)
+def post_chat_message(token, chatId):
+    try:
+        headers = {'Authorization': f'Bearer {token}'}
+        data = request.get_json(force=True)
+        url = f'{DEVICE_URL}/chats/{chatId}/messages'
+        r = requests.post(url, headers=headers, json=data)
+        return (r.content, r.status_code, r.headers.items())
+    except Exception as e:
+        return jsonify({'error': str(e)}), 500
 
-# === WebSocket Proxy Handler ===
+# Health check endpoint (optional)
+@app.route('/health', methods=['GET'])
+def health():
+    return jsonify({'status': 'ok'})
 
-async def websocket_handler(request):
-    ws_server = web.WebSocketResponse()
-    await ws_server.prepare(request)
-    token = get_session_token(request)
-    ws_url = f"{DEVICE_BASE_URL.replace('http', 'ws')}/ws"
-    headers = {}
-    if token:
-        headers["Authorization"] = token
-
-    async with ClientSession() as session:
-        async with session.ws_connect(ws_url, headers=headers) as ws_client:
-            async def ws_forward(ws_from, ws_to):
-                async for msg in ws_from:
-                    if msg.type == WSMsgType.TEXT:
-                        await ws_to.send_str(msg.data)
-                    elif msg.type == WSMsgType.BINARY:
-                        await ws_to.send_bytes(msg.data)
-                    elif msg.type == WSMsgType.CLOSE:
-                        await ws_to.close()
-                        break
-
-            await asyncio.gather(
-                ws_forward(ws_server, ws_client),
-                ws_forward(ws_client, ws_server)
-            )
-    return ws_server
-
-# === App setup ===
-
-app = web.Application()
-app.add_routes([
-    web.post('/session/login', login),
-    web.post('/session/logout', logout),
-    web.get('/schedules', get_schedules),
-    web.post('/schedules', post_schedules),
-    web.get('/posts', get_posts),
-    web.post('/posts', post_posts),
-    web.get('/search', search),
-    web.get('/chats/{chatId}/messages', get_chat_messages),
-    web.post('/chats/{chatId}/messages', post_chat_messages),
-    web.get('/ws', websocket_handler)
-])
-
-if __name__ == "__main__":
-    web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
+if __name__ == '__main__':
+    app.run(host=SERVER_HOST, port=SERVER_PORT)
