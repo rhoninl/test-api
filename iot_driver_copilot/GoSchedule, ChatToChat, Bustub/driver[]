@@ -1,0 +1,110 @@
+import os
+import json
+import requests
+from flask import Flask, request, jsonify, Response, stream_with_context
+from functools import wraps
+
+# Environment Variable Configuration
+DEVICE_BASE_URL = os.environ.get('DEVICE_BASE_URL', 'http://127.0.0.1:8000')
+HTTP_SERVER_HOST = os.environ.get('HTTP_SERVER_HOST', '0.0.0.0')
+HTTP_SERVER_PORT = int(os.environ.get('HTTP_SERVER_PORT', '8080'))
+
+# Flask App
+app = Flask(__name__)
+
+# Simple in-memory session token storage (for demonstration; not for production)
+session_token = None
+
+def require_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        token = request.headers.get('Authorization')
+        global session_token
+        if not token or session_token is None or token != f"Bearer {session_token}":
+            return jsonify({"error": "Unauthorized"}), 401
+        return f(*args, **kwargs)
+    return decorated
+
+@app.route('/session/login', methods=['POST'])
+def proxy_login():
+    url = f"{DEVICE_BASE_URL}/session/login"
+    headers = {'Content-Type': 'application/json'}
+    resp = requests.post(url, json=request.json, headers=headers)
+    global session_token
+    if resp.ok:
+        data = resp.json()
+        session_token = data.get('token') or data.get('session_token')
+        # Return the raw token for client use
+        return jsonify(data), resp.status_code
+    return Response(resp.content, status=resp.status_code, mimetype=resp.headers.get('Content-Type'))
+
+@app.route('/session/logout', methods=['POST'])
+@require_auth
+def proxy_logout():
+    url = f"{DEVICE_BASE_URL}/session/logout"
+    token = request.headers.get('Authorization')
+    headers = {'Authorization': token}
+    resp = requests.post(url, headers=headers)
+    global session_token
+    if resp.ok:
+        session_token = None
+    return Response(resp.content, status=resp.status_code, mimetype=resp.headers.get('Content-Type'))
+
+@app.route('/schedules', methods=['GET', 'POST'])
+@require_auth
+def proxy_schedules():
+    url = f"{DEVICE_BASE_URL}/schedules"
+    token = request.headers.get('Authorization')
+    headers = {'Authorization': token}
+    if request.method == 'GET':
+        resp = requests.get(url, headers=headers, params=request.args)
+    else:
+        headers['Content-Type'] = 'application/json'
+        resp = requests.post(url, headers=headers, json=request.json)
+    return Response(resp.content, status=resp.status_code, mimetype=resp.headers.get('Content-Type'))
+
+@app.route('/posts', methods=['GET', 'POST'])
+@require_auth
+def proxy_posts():
+    url = f"{DEVICE_BASE_URL}/posts"
+    token = request.headers.get('Authorization')
+    headers = {'Authorization': token}
+    if request.method == 'GET':
+        resp = requests.get(url, headers=headers, params=request.args)
+    else:
+        headers['Content-Type'] = 'application/json'
+        resp = requests.post(url, headers=headers, json=request.json)
+    return Response(resp.content, status=resp.status_code, mimetype=resp.headers.get('Content-Type'))
+
+@app.route('/search', methods=['GET'])
+@require_auth
+def proxy_search():
+    url = f"{DEVICE_BASE_URL}/search"
+    token = request.headers.get('Authorization')
+    headers = {'Authorization': token}
+    resp = requests.get(url, headers=headers, params=request.args)
+    return Response(resp.content, status=resp.status_code, mimetype=resp.headers.get('Content-Type'))
+
+@app.route('/chats/<chatId>/messages', methods=['GET', 'POST'])
+@require_auth
+def proxy_chat_messages(chatId):
+    url = f"{DEVICE_BASE_URL}/chats/{chatId}/messages"
+    token = request.headers.get('Authorization')
+    headers = {'Authorization': token}
+    if request.method == 'GET':
+        resp = requests.get(url, headers=headers, params=request.args)
+    else:
+        headers['Content-Type'] = 'application/json'
+        resp = requests.post(url, headers=headers, json=request.json)
+    return Response(resp.content, status=resp.status_code, mimetype=resp.headers.get('Content-Type'))
+
+# Stream WebSocket messages over HTTP as SSE (Server-Sent Events) if needed
+@app.route('/chats/<chatId>/stream', methods=['GET'])
+@require_auth
+def proxy_chat_stream(chatId):
+    # This is pseudo-implementation; real implementation would require WebSocket client libs,
+    # but per requirements, only HTTP(S) is proxied.
+    return jsonify({"error": "WebSocket streaming is not supported via HTTP proxy in this driver."}), 501
+
+if __name__ == '__main__':
+    app.run(host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT)
