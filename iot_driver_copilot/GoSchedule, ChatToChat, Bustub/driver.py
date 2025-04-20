@@ -1,22 +1,23 @@
 import os
+import json
+import asyncio
 import uvicorn
-from fastapi import FastAPI, Request, Response, Header, status, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException, status, Depends
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
-from typing import Optional
 
-# Read configuration from environment variables
-DEVICE_HOST = os.environ.get("DEVICE_HOST", "127.0.0.1")
-DEVICE_PORT = int(os.environ.get("DEVICE_PORT", "8000"))
-DEVICE_SCHEME = os.environ.get("DEVICE_SCHEME", "http")
-SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "8888"))
-WS_PORT = int(os.environ.get("WS_PORT", "8765"))
+# Environment variables for configuration
+DEVICE_HTTP_HOST = os.getenv('DEVICE_HTTP_HOST', '127.0.0.1')
+DEVICE_HTTP_PORT = int(os.getenv('DEVICE_HTTP_PORT', '8000'))
+DEVICE_API_BASE = os.getenv('DEVICE_API_BASE', 'http://127.0.0.1:9000')
+DEVICE_WS_BASE = os.getenv('DEVICE_WS_BASE', 'ws://127.0.0.1:9001')
+DEVICE_API_TIMEOUT = int(os.getenv('DEVICE_API_TIMEOUT', '10'))
 
-DEVICE_BASE = f"{DEVICE_SCHEME}://{DEVICE_HOST}:{DEVICE_PORT}"
-
+# FastAPI app
 app = FastAPI()
+
+# Enable CORS if needed for browser access
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -25,106 +26,116 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-client = httpx.AsyncClient(timeout=30)
+# Utility: Forward REST API request to backend
+async def forward_api_request(method, path, headers=None, params=None, data=None, json_body=None):
+    url = DEVICE_API_BASE + path
+    async with httpx.AsyncClient(timeout=DEVICE_API_TIMEOUT) as client:
+        req_headers = dict(headers or {})
+        if 'host' in req_headers:
+            req_headers.pop('host')
+        response = await client.request(
+            method=method,
+            url=url,
+            headers=req_headers,
+            params=params,
+            data=data,
+            json=json_body
+        )
+        return JSONResponse(
+            status_code=response.status_code,
+            content=response.json() if response.headers.get("content-type", "").startswith("application/json") else response.text
+        )
 
-def _auth_header(authorization: Optional[str]):
-    if authorization:
-        return {"Authorization": authorization}
-    return {}
-
+# 1. Authenticate a user (login)
 @app.post("/session/login")
-async def session_login(request: Request):
+async def api_session_login(request: Request):
     body = await request.json()
-    url = f"{DEVICE_BASE}/session/login"
-    async with httpx.AsyncClient() as ac:
-        resp = await ac.post(url, json=body)
-        return Response(content=resp.content, status_code=resp.status_code, headers=resp.headers, media_type="application/json")
+    return await forward_api_request('POST', '/session/login', headers=request.headers, json_body=body)
 
+# 2. Invalidate session token (logout)
 @app.post("/session/logout")
-async def session_logout(Authorization: Optional[str] = Header(None)):
-    url = f"{DEVICE_BASE}/session/logout"
-    headers = _auth_header(Authorization)
-    async with httpx.AsyncClient() as ac:
-        resp = await ac.post(url, headers=headers)
-        return Response(content=resp.content, status_code=resp.status_code, headers=resp.headers, media_type="application/json")
+async def api_session_logout(request: Request):
+    auth = request.headers.get("Authorization")
+    if not auth:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Missing Authorization header")
+    return await forward_api_request('POST', '/session/logout', headers=request.headers)
 
+# 3. Fetch scheduled tasks
 @app.get("/schedules")
-async def get_schedules(Authorization: Optional[str] = Header(None)):
-    url = f"{DEVICE_BASE}/schedules"
-    headers = _auth_header(Authorization)
-    async with httpx.AsyncClient() as ac:
-        resp = await ac.get(url, headers=headers)
-        return Response(content=resp.content, status_code=resp.status_code, headers=resp.headers, media_type="application/json")
+async def api_get_schedules(request: Request):
+    return await forward_api_request('GET', '/schedules', headers=request.headers, params=dict(request.query_params))
 
+# 4. Create new task
 @app.post("/schedules")
-async def create_schedule(request: Request, Authorization: Optional[str] = Header(None)):
+async def api_create_schedule(request: Request):
     body = await request.json()
-    url = f"{DEVICE_BASE}/schedules"
-    headers = _auth_header(Authorization)
-    async with httpx.AsyncClient() as ac:
-        resp = await ac.post(url, json=body, headers=headers)
-        return Response(content=resp.content, status_code=resp.status_code, headers=resp.headers, media_type="application/json")
+    return await forward_api_request('POST', '/schedules', headers=request.headers, json_body=body)
 
+# 5. Retrieve recent posts
 @app.get("/posts")
-async def get_posts(request: Request, Authorization: Optional[str] = Header(None)):
-    params = dict(request.query_params)
-    url = f"{DEVICE_BASE}/posts"
-    headers = _auth_header(Authorization)
-    async with httpx.AsyncClient() as ac:
-        resp = await ac.get(url, params=params, headers=headers)
-        return Response(content=resp.content, status_code=resp.status_code, headers=resp.headers, media_type="application/json")
+async def api_get_posts(request: Request):
+    return await forward_api_request('GET', '/posts', headers=request.headers, params=dict(request.query_params))
 
+# 6. Submit new post
 @app.post("/posts")
-async def create_post(request: Request, Authorization: Optional[str] = Header(None)):
+async def api_create_post(request: Request):
     body = await request.json()
-    url = f"{DEVICE_BASE}/posts"
-    headers = _auth_header(Authorization)
-    async with httpx.AsyncClient() as ac:
-        resp = await ac.post(url, json=body, headers=headers)
-        return Response(content=resp.content, status_code=resp.status_code, headers=resp.headers, media_type="application/json")
+    return await forward_api_request('POST', '/posts', headers=request.headers, json_body=body)
 
+# 7. Global search
 @app.get("/search")
-async def search(request: Request, Authorization: Optional[str] = Header(None)):
-    params = dict(request.query_params)
-    url = f"{DEVICE_BASE}/search"
-    headers = _auth_header(Authorization)
-    async with httpx.AsyncClient() as ac:
-        resp = await ac.get(url, params=params, headers=headers)
-        return Response(content=resp.content, status_code=resp.status_code, headers=resp.headers, media_type="application/json")
+async def api_search(request: Request):
+    return await forward_api_request('GET', '/search', headers=request.headers, params=dict(request.query_params))
 
+# 8. Load message history for a chat
 @app.get("/chats/{chatId}/messages")
-async def get_chat_messages(chatId: str, Authorization: Optional[str] = Header(None)):
-    url = f"{DEVICE_BASE}/chats/{chatId}/messages"
-    headers = _auth_header(Authorization)
-    async with httpx.AsyncClient() as ac:
-        resp = await ac.get(url, headers=headers)
-        return Response(content=resp.content, status_code=resp.status_code, headers=resp.headers, media_type="application/json")
+async def api_get_chat_messages(chatId: str, request: Request):
+    path = f"/chats/{chatId}/messages"
+    return await forward_api_request('GET', path, headers=request.headers, params=dict(request.query_params))
 
+# 9. Send a new chat message
 @app.post("/chats/{chatId}/messages")
-async def send_chat_message(chatId: str, request: Request, Authorization: Optional[str] = Header(None)):
+async def api_post_chat_message(chatId: str, request: Request):
+    path = f"/chats/{chatId}/messages"
     body = await request.json()
-    url = f"{DEVICE_BASE}/chats/{chatId}/messages"
-    headers = _auth_header(Authorization)
-    async with httpx.AsyncClient() as ac:
-        resp = await ac.post(url, json=body, headers=headers)
-        return Response(content=resp.content, status_code=resp.status_code, headers=resp.headers, media_type="application/json")
+    return await forward_api_request('POST', path, headers=request.headers, json_body=body)
 
-@app.websocket("/ws/{path:path}")
+# WebSocket proxy: Proxy client <-> backend WebSocket stream
+@app.websocket("/ws/proxy/{path:path}")
 async def websocket_proxy(websocket: WebSocket, path: str):
+    # Accept client WebSocket connection
     await websocket.accept()
-    target_url = f"ws://{DEVICE_HOST}:{WS_PORT}/{path}"
+    backend_ws_url = DEVICE_WS_BASE.rstrip('/') + '/' + path
     try:
-        async with httpx.AsyncClient() as ac:
-            async with ac.stream("GET", target_url) as ws_stream:
-                while True:
-                    data = await websocket.receive_text()
-                    await ws_stream.send_bytes(data.encode())
-                    async for chunk in ws_stream.aiter_bytes():
-                        await websocket.send_text(chunk.decode())
-    except WebSocketDisconnect:
-        pass
-    except Exception as e:
-        await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
+        async with httpx.AsyncClient() as client:
+            async with client.websocket_connect(backend_ws_url) as backend_ws:
+                async def client_to_backend():
+                    try:
+                        while True:
+                            msg = await websocket.receive_text()
+                            await backend_ws.send_text(msg)
+                    except WebSocketDisconnect:
+                        await backend_ws.aclose()
+                    except Exception:
+                        pass
+
+                async def backend_to_client():
+                    try:
+                        while True:
+                            msg = await backend_ws.receive_text()
+                            await websocket.send_text(msg)
+                    except Exception:
+                        await websocket.close()
+
+                await asyncio.gather(client_to_backend(), backend_to_client())
+    except Exception:
+        await websocket.close(code=1001)
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host=SERVER_HOST, port=SERVER_PORT)
+    uvicorn.run(
+        "main:app",
+        host=DEVICE_HTTP_HOST,
+        port=DEVICE_HTTP_PORT,
+        reload=False,
+        access_log=True
+    )
