@@ -1,24 +1,25 @@
 import os
 import json
 import asyncio
-import uvicorn
-from typing import Optional, List, Dict, Any
-from fastapi import FastAPI, Request, WebSocket, WebSocketDisconnect, HTTPException, Depends
-from fastapi.responses import JSONResponse
+import websockets
+from typing import Optional
+from urllib.parse import urlencode, urljoin
+
+from fastapi import FastAPI, Request, Response, status, HTTPException, Header
+from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.middleware.cors import CORSMiddleware
 import httpx
 
-# Environment variables for configuration
-DEVICE_HOST = os.environ.get("DEVICE_HOST", "127.0.0.1")
-DEVICE_PORT = int(os.environ.get("DEVICE_PORT", "8080"))
-DEVICE_SCHEME = os.environ.get("DEVICE_SCHEME", "http")  # "http" or "https"
-SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "8000"))
+DEVICE_IP = os.getenv("DEVICE_IP", "127.0.0.1")
+DEVICE_REST_PORT = int(os.getenv("DEVICE_REST_PORT", "8080"))
+DEVICE_WS_PORT = int(os.getenv("DEVICE_WS_PORT", "8081"))
+SERVER_HOST = os.getenv("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.getenv("SERVER_PORT", "8000"))
 
-# Compose base URL for backend device
-DEVICE_BASE_URL = f"{DEVICE_SCHEME}://{DEVICE_HOST}:{DEVICE_PORT}"
+REST_BASE = f"http://{DEVICE_IP}:{DEVICE_REST_PORT}"
+WS_BASE = f"ws://{DEVICE_IP}:{DEVICE_WS_PORT}"
 
-app = FastAPI(title="GoSchedule ChatToChat Bustub HTTP Proxy Driver")
+app = FastAPI()
 
 app.add_middleware(
     CORSMiddleware,
@@ -27,118 +28,125 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# In-memory session store for demo (not for production use)
-session_tokens: Dict[str, str] = {}
+# --- Session Management Helper ---
+def extract_auth_token(request: Request):
+    auth_header = request.headers.get("authorization")
+    if not auth_header or not auth_header.lower().startswith("bearer "):
+        raise HTTPException(status_code=401, detail="Missing or invalid Authorization header")
+    return auth_header[7:]
 
-def get_authorization_header(request: Request) -> Optional[str]:
-    return request.headers.get('authorization') or request.headers.get('Authorization')
-
-def get_token_from_header(request: Request) -> Optional[str]:
-    auth = get_authorization_header(request)
-    if auth and auth.lower().startswith("bearer "):
-        return auth[7:]
-    return auth
-
-async def proxy_request(
-    method: str,
-    path: str,
-    request: Request,
-    path_params: Optional[Dict[str, Any]] = None,
-    query_params: Optional[Dict[str, str]] = None,
-    body: Optional[Any] = None,
-    add_auth: bool = True,
-) -> JSONResponse:
-    url = DEVICE_BASE_URL + path.format(**(path_params or {}))
-    headers = dict(request.headers)
-    # Remove host and content-length, httpx will set them
-    headers.pop('host', None)
-    headers.pop('content-length', None)
-    token = get_token_from_header(request)
-    if add_auth and token:
-        headers['Authorization'] = f"Bearer {token}"
-    async with httpx.AsyncClient() as client:
-        try:
-            resp = await client.request(
-                method=method,
-                url=url,
-                headers=headers,
-                params=query_params,
-                json=body
-            )
-        except httpx.RequestError as exc:
-            raise HTTPException(status_code=502, detail=str(exc))
-        return JSONResponse(
-            status_code=resp.status_code,
-            content=resp.json() if resp.headers.get("content-type", "").startswith("application/json") else resp.text
-        )
+# --- REST Proxy Endpoints ---
 
 @app.post("/session/login")
 async def session_login(request: Request):
     body = await request.json()
-    resp = await proxy_request("POST", "/session/login", request, body=body, add_auth=False)
-    # Optionally keep a local session if needed
-    try:
-        token = resp.body.decode()
-        token = json.loads(token).get("token")
-        if token:
-            session_tokens[token] = "active"
-    except Exception:
-        pass
-    return resp
+    async with httpx.AsyncClient() as client:
+        r = await client.post(urljoin(REST_BASE, "/session/login"), json=body)
+        return Response(r.content, status_code=r.status_code, headers=dict(r.headers))
 
 @app.post("/session/logout")
 async def session_logout(request: Request):
-    resp = await proxy_request("POST", "/session/logout", request)
-    token = get_token_from_header(request)
-    if token and token in session_tokens:
-        del session_tokens[token]
-    return resp
+    token = extract_auth_token(request)
+    headers = {"Authorization": f"Bearer {token}"}
+    async with httpx.AsyncClient() as client:
+        r = await client.post(urljoin(REST_BASE, "/session/logout"), headers=headers)
+        return Response(r.content, status_code=r.status_code, headers=dict(r.headers))
 
 @app.get("/schedules")
 async def get_schedules(request: Request):
-    return await proxy_request("GET", "/schedules", request)
+    token = extract_auth_token(request)
+    headers = {"Authorization": f"Bearer {token}"}
+    async with httpx.AsyncClient() as client:
+        r = await client.get(urljoin(REST_BASE, "/schedules"), headers=headers)
+        return Response(r.content, status_code=r.status_code, headers=dict(r.headers))
 
 @app.post("/schedules")
 async def create_schedule(request: Request):
+    token = extract_auth_token(request)
+    headers = {"Authorization": f"Bearer {token}"}
     body = await request.json()
-    return await proxy_request("POST", "/schedules", request, body=body)
+    async with httpx.AsyncClient() as client:
+        r = await client.post(urljoin(REST_BASE, "/schedules"), json=body, headers=headers)
+        return Response(r.content, status_code=r.status_code, headers=dict(r.headers))
 
 @app.get("/posts")
 async def get_posts(request: Request):
-    query_params = dict(request.query_params)
-    return await proxy_request("GET", "/posts", request, query_params=query_params)
+    token = extract_auth_token(request)
+    headers = {"Authorization": f"Bearer {token}"}
+    query = request.query_params
+    url = urljoin(REST_BASE, "/posts")
+    if query:
+        url = f"{url}?{urlencode(query)}"
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url, headers=headers)
+        return Response(r.content, status_code=r.status_code, headers=dict(r.headers))
 
 @app.post("/posts")
 async def create_post(request: Request):
+    token = extract_auth_token(request)
+    headers = {"Authorization": f"Bearer {token}"}
     body = await request.json()
-    return await proxy_request("POST", "/posts", request, body=body)
+    async with httpx.AsyncClient() as client:
+        r = await client.post(urljoin(REST_BASE, "/posts"), json=body, headers=headers)
+        return Response(r.content, status_code=r.status_code, headers=dict(r.headers))
 
 @app.get("/search")
 async def search(request: Request):
-    query_params = dict(request.query_params)
-    return await proxy_request("GET", "/search", request, query_params=query_params)
+    token = extract_auth_token(request)
+    headers = {"Authorization": f"Bearer {token}"}
+    query = request.query_params
+    url = urljoin(REST_BASE, "/search")
+    if query:
+        url = f"{url}?{urlencode(query)}"
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url, headers=headers)
+        return Response(r.content, status_code=r.status_code, headers=dict(r.headers))
 
 @app.get("/chats/{chatId}/messages")
 async def get_chat_messages(chatId: str, request: Request):
-    return await proxy_request("GET", f"/chats/{chatId}/messages", request, path_params={"chatId": chatId})
+    token = extract_auth_token(request)
+    headers = {"Authorization": f"Bearer {token}"}
+    url = urljoin(REST_BASE, f"/chats/{chatId}/messages")
+    async with httpx.AsyncClient() as client:
+        r = await client.get(url, headers=headers)
+        return Response(r.content, status_code=r.status_code, headers=dict(r.headers))
 
 @app.post("/chats/{chatId}/messages")
 async def send_chat_message(chatId: str, request: Request):
+    token = extract_auth_token(request)
+    headers = {"Authorization": f"Bearer {token}"}
     body = await request.json()
-    return await proxy_request("POST", f"/chats/{chatId}/messages", request, path_params={"chatId": chatId}, body=body)
-
-# WebSocket proxy example for chat (if backend supports WebSocket natively)
-@app.websocket("/ws/chats/{chatId}")
-async def websocket_chat_proxy(websocket: WebSocket, chatId: str):
-    await websocket.accept()
-    backend_url = f"{DEVICE_SCHEME}://{DEVICE_HOST}:{DEVICE_PORT}/ws/chats/{chatId}"
+    url = urljoin(REST_BASE, f"/chats/{chatId}/messages")
     async with httpx.AsyncClient() as client:
+        r = await client.post(url, json=body, headers=headers)
+        return Response(r.content, status_code=r.status_code, headers=dict(r.headers))
+
+
+# --- WebSocket Proxy (convert WS to HTTP stream for browser/commandline) ---
+
+@app.get("/chats/{chatId}/ws-messages")
+async def proxy_chat_ws_messages(chatId: str, request: Request):
+    """
+    HTTP stream (Server-Sent Events) that proxies chat messages from the device's WebSocket.
+    Client must provide Authorization header.
+    """
+    token = extract_auth_token(request)
+    ws_url = f"{WS_BASE}/chats/{chatId}/ws-messages"
+
+    async def event_stream():
         try:
-            async with client.stream("GET", backend_url) as backend_stream:
-                async for chunk in backend_stream.aiter_bytes():
-                    await websocket.send_bytes(chunk)
-        except Exception as exc:
-            await websocket.close(code=1011)
+            async with websockets.connect(
+                ws_url, extra_headers={"Authorization": f"Bearer {token}"}
+            ) as websocket:
+                while True:
+                    msg = await websocket.recv()
+                    yield f"data: {msg}\n\n"
+        except Exception as e:
+            yield f"event: error\ndata: {json.dumps({'error': str(e)})}\n\n"
+
+    return StreamingResponse(event_stream(), media_type="text/event-stream")
+
 
 if __name__ == "__main__":
-    uvicorn.run("main:app", host=SERVER_HOST, port=SERVER_PORT)
+    import uvicorn
+    uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT)
