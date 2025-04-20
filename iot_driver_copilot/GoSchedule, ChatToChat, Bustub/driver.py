@@ -1,139 +1,136 @@
 import os
 import json
-import asyncio
-from functools import wraps
-from urllib.parse import urlencode
+import requests
+from flask import Flask, request, Response, jsonify, stream_with_context
 
-from aiohttp import web, ClientSession, WSMsgType
+app = Flask(__name__)
 
-# Load configuration from environment variables
-DEVICE_HOST = os.environ.get('DEVICE_HOST', '127.0.0.1')
-DEVICE_PORT = int(os.environ.get('DEVICE_PORT', 8080))
-SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.environ.get('SERVER_PORT', 5000))
-USE_HTTPS = os.environ.get('USE_HTTPS', 'false').lower() == 'true'
-HTTP_TIMEOUT = int(os.environ.get('HTTP_TIMEOUT', 30))
+# Environment Variables
+DEVICE_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
+DEVICE_PORT = os.environ.get("DEVICE_PORT", "80")
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", 8080))
+DEVICE_PROTOCOL = os.environ.get("DEVICE_PROTOCOL", "http")
+DEVICE_BASE_URL = f"{DEVICE_PROTOCOL}://{DEVICE_IP}:{DEVICE_PORT}"
 
-BASE_URL = f"{'https' if USE_HTTPS else 'http'}://{DEVICE_HOST}:{DEVICE_PORT}"
+# --- Utility Functions ---
 
-async def proxy_request(request, method, remote_path, path_params=None, query_params=None, json_body=True):
-    headers = dict(request.headers)
-    # Remove hop-by-hop headers
-    headers.pop('Host', None)
-    # Compose target URL
-    if path_params:
-        remote_path = remote_path.format(**path_params)
-    url = f"{BASE_URL}{remote_path}"
-    if query_params:
-        url += '?' + urlencode(query_params)
-    # Prepare body
-    data = None
-    if json_body and request.can_read_body:
-        try:
-            data = await request.json()
-        except Exception:
-            data = None
-    elif request.can_read_body:
-        data = await request.read()
-    # Proxy to device REST API
-    async with ClientSession(timeout=web.ClientTimeout(total=HTTP_TIMEOUT)) as session:
-        async with session.request(method, url, headers=headers, json=data if json_body else None, data=None if json_body else data) as resp:
-            body = await resp.read()
-            response = web.Response(
-                status=resp.status,
-                headers={k: v for k, v in resp.headers.items() if k.lower() != 'transfer-encoding'},
-                body=body
-            )
-            return response
+def device_api_url(path):
+    return f"{DEVICE_BASE_URL}{path}"
 
-def require_auth(handler):
-    @wraps(handler)
-    async def wrapper(request):
-        auth = request.headers.get('Authorization')
-        if not auth and request.path != '/session/login':
-            return web.json_response({'error': 'Missing Authorization header'}, status=401)
-        return await handler(request)
-    return wrapper
+def forward_headers(exclude=None):
+    exclude = exclude or []
+    headers = {}
+    for key, value in request.headers.items():
+        lk = key.lower()
+        if lk not in exclude:
+            headers[key] = value
+    return headers
 
-app = web.Application()
+def proxy_device_request(method, path, data=None, params=None, stream=False):
+    url = device_api_url(path)
+    headers = forward_headers(exclude=["host", "content-length"])
+    try:
+        resp = requests.request(
+            method=method,
+            url=url,
+            headers=headers,
+            params=params,
+            data=data,
+            json=None if not request.is_json else request.get_json(silent=True),
+            stream=stream,
+            timeout=30
+        )
+        return resp
+    except requests.RequestException as ex:
+        return None
 
-# Session endpoints
-@app.route('POST', '/session/login')
-async def login(request):
-    return await proxy_request(request, 'POST', '/session/login')
+# --- Authentication Endpoints ---
 
-@app.route('POST', '/session/logout')
-@require_auth
-async def logout(request):
-    return await proxy_request(request, 'POST', '/session/logout')
+@app.route('/session/login', methods=['POST'])
+def session_login():
+    resp = proxy_device_request("POST", "/session/login", data=request.data)
+    if resp is None:
+        return jsonify({"error": "Device unreachable"}), 502
+    return (resp.content, resp.status_code, resp.headers.items())
 
-# Schedules
-@app.route('GET', '/schedules')
-@require_auth
-async def get_schedules(request):
-    return await proxy_request(request, 'GET', '/schedules')
+@app.route('/session/logout', methods=['POST'])
+def session_logout():
+    resp = proxy_device_request("POST", "/session/logout", data=request.data)
+    if resp is None:
+        return jsonify({"error": "Device unreachable"}), 502
+    return (resp.content, resp.status_code, resp.headers.items())
 
-@app.route('POST', '/schedules')
-@require_auth
-async def create_schedule(request):
-    return await proxy_request(request, 'POST', '/schedules')
+# --- Schedules Endpoints ---
 
-# Posts
-@app.route('GET', '/posts')
-@require_auth
-async def get_posts(request):
-    return await proxy_request(request, 'GET', '/posts', query_params=request.rel_url.query)
+@app.route('/schedules', methods=['GET', 'POST'])
+def schedules():
+    if request.method == 'GET':
+        resp = proxy_device_request("GET", "/schedules", params=request.args)
+        if resp is None:
+            return jsonify({"error": "Device unreachable"}), 502
+        return (resp.content, resp.status_code, resp.headers.items())
+    elif request.method == 'POST':
+        resp = proxy_device_request("POST", "/schedules", data=request.data)
+        if resp is None:
+            return jsonify({"error": "Device unreachable"}), 502
+        return (resp.content, resp.status_code, resp.headers.items())
 
-@app.route('POST', '/posts')
-@require_auth
-async def create_post(request):
-    return await proxy_request(request, 'POST', '/posts')
+# --- Posts Endpoints ---
 
-# Search
-@app.route('GET', '/search')
-@require_auth
-async def search(request):
-    return await proxy_request(request, 'GET', '/search', query_params=request.rel_url.query)
+@app.route('/posts', methods=['GET', 'POST'])
+def posts():
+    if request.method == 'GET':
+        resp = proxy_device_request("GET", "/posts", params=request.args)
+        if resp is None:
+            return jsonify({"error": "Device unreachable"}), 502
+        return (resp.content, resp.status_code, resp.headers.items())
+    elif request.method == 'POST':
+        resp = proxy_device_request("POST", "/posts", data=request.data)
+        if resp is None:
+            return jsonify({"error": "Device unreachable"}), 502
+        return (resp.content, resp.status_code, resp.headers.items())
 
-# Chat messages
-@app.route('GET', '/chats/{chatId}/messages')
-@require_auth
-async def get_chat_messages(request):
-    return await proxy_request(request, 'GET', '/chats/{chatId}/messages', path_params=request.match_info)
+# --- Search Endpoint ---
 
-@app.route('POST', '/chats/{chatId}/messages')
-@require_auth
-async def post_chat_message(request):
-    return await proxy_request(request, 'POST', '/chats/{chatId}/messages', path_params=request.match_info)
+@app.route('/search', methods=['GET'])
+def search():
+    resp = proxy_device_request("GET", "/search", params=request.args)
+    if resp is None:
+        return jsonify({"error": "Device unreachable"}), 502
+    return (resp.content, resp.status_code, resp.headers.items())
 
-# WebSocket proxy
-@app.route('GET', '/ws/{tail:.*}')
-async def ws_proxy(request):
-    ws_server = web.WebSocketResponse()
-    await ws_server.prepare(request)
-    tail = request.match_info['tail']
-    target_url = f"{'ws' if not USE_HTTPS else 'wss'}://{DEVICE_HOST}:{DEVICE_PORT}/ws/{tail}"
-    headers = {k: v for k, v in request.headers.items() if k.lower() != 'host'}
-    async with ClientSession() as session:
-        async with session.ws_connect(target_url, headers=headers) as ws_client:
-            async def ws_to_client():
-                async for msg in ws_client:
-                    if msg.type == WSMsgType.TEXT:
-                        await ws_server.send_str(msg.data)
-                    elif msg.type == WSMsgType.BINARY:
-                        await ws_server.send_bytes(msg.data)
-                    elif msg.type == WSMsgType.CLOSE:
-                        await ws_server.close()
-            async def ws_to_server():
-                async for msg in ws_server:
-                    if msg.type == WSMsgType.TEXT:
-                        await ws_client.send_str(msg.data)
-                    elif msg.type == WSMsgType.BINARY:
-                        await ws_client.send_bytes(msg.data)
-                    elif msg.type == WSMsgType.CLOSE:
-                        await ws_client.close()
-            await asyncio.gather(ws_to_client(), ws_to_server())
-    return ws_server
+# --- Chat Endpoints ---
 
-if __name__ == "__main__":
-    web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
+@app.route('/chats/<chatId>/messages', methods=['GET', 'POST'])
+def chat_messages(chatId):
+    path = f"/chats/{chatId}/messages"
+    if request.method == 'GET':
+        resp = proxy_device_request("GET", path, params=request.args)
+        if resp is None:
+            return jsonify({"error": "Device unreachable"}), 502
+        return (resp.content, resp.status_code, resp.headers.items())
+    elif request.method == 'POST':
+        resp = proxy_device_request("POST", path, data=request.data)
+        if resp is None:
+            return jsonify({"error": "Device unreachable"}), 502
+        return (resp.content, resp.status_code, resp.headers.items())
+
+# --- HTTP Proxy Streaming for Large Responses (Optional) ---
+
+@app.route('/proxy/stream', methods=['GET'])
+def proxy_stream():
+    target_path = request.args.get("path")
+    if not target_path:
+        return jsonify({"error": "Missing 'path' query parameter"}), 400
+    def generate():
+        with requests.get(device_api_url(target_path), headers=forward_headers(), stream=True) as r:
+            for chunk in r.iter_content(chunk_size=4096):
+                if chunk:
+                    yield chunk
+    return Response(stream_with_context(generate()), content_type='application/octet-stream')
+
+# --- Main ---
+
+if __name__ == '__main__':
+    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
