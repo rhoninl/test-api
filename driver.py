@@ -1,132 +1,97 @@
 import os
 import json
-import asyncio
-from urllib.parse import urlencode, urljoin
-from aiohttp import ClientSession, web, WSMsgType
+from functools import wraps
+from urllib.parse import urlencode
 
-DEVICE_HOST = os.environ.get("DEVICE_HOST", "localhost")
-DEVICE_PORT = os.environ.get("DEVICE_PORT", "8080")
-DEVICE_PROTOCOL = os.environ.get("DEVICE_PROTOCOL", "http")
+from flask import Flask, request, jsonify, Response, stream_with_context
+import requests
+
+# Environment variables for configuration
+DEVICE_API_HOST = os.environ.get("DEVICE_API_HOST", "localhost")
+DEVICE_API_PORT = os.environ.get("DEVICE_API_PORT", "8080")
+DEVICE_API_PROTOCOL = os.environ.get("DEVICE_API_PROTOCOL", "http")
 SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
 SERVER_PORT = int(os.environ.get("SERVER_PORT", "8000"))
 
-BASE_URL = f"{DEVICE_PROTOCOL}://{DEVICE_HOST}:{DEVICE_PORT}"
+API_BASE = f"{DEVICE_API_PROTOCOL}://{DEVICE_API_HOST}:{DEVICE_API_PORT}"
 
-# --- HTTP REST Proxy Handlers ---
+app = Flask(__name__)
 
-async def proxy_request(request, path, method="GET", json_body=False, extra_path_params=None):
-    url = urljoin(BASE_URL, path)
-    if extra_path_params:
-        url = url.format(**extra_path_params)
-    headers = dict(request.headers)
-    if "Host" in headers:
-        del headers["Host"]
+def require_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        auth_header = request.headers.get("Authorization")
+        if not auth_header:
+            return jsonify({"error": "Unauthorized"}), 401
+        return f(*args, **kwargs)
+    return decorated
 
-    params = dict(request.query)
-    data = None
-    if request.method in {"POST", "PUT", "PATCH"}:
-        try:
-            data = await request.json()
-        except Exception:
-            data = await request.text()
-    async with ClientSession() as session:
-        req_args = {
-            "headers": headers,
-            "params": params,
-        }
-        if data:
-            if isinstance(data, dict):
-                req_args["json"] = data
-            else:
-                req_args["data"] = data
-        async with session.request(method, url, **req_args) as resp:
-            body = await resp.read()
-            return web.Response(
-                status=resp.status,
-                headers={k: v for k, v in resp.headers.items() if k.lower() != "transfer-encoding"},
-                body=body,
-            )
+def proxy_request(method, target_path, auth_forward=False, stream=False, **kwargs):
+    url = f"{API_BASE}{target_path}"
+    headers = {}
+    if auth_forward:
+        auth_header = request.headers.get("Authorization")
+        if auth_header:
+            headers["Authorization"] = auth_header
+    if "headers" in kwargs:
+        headers.update(kwargs["headers"])
+        del kwargs["headers"]
+    resp = requests.request(
+        method,
+        url,
+        headers=headers,
+        params=request.args,
+        data=request.data if request.data else None,
+        json=request.get_json(silent=True),
+        stream=stream
+    )
+    excluded_headers = ["content-encoding", "content-length", "transfer-encoding", "connection"]
+    response_headers = [(name, value) for (name, value) in resp.raw.headers.items()
+                        if name.lower() not in excluded_headers]
+    if stream:
+        return Response(stream_with_context(resp.iter_content(chunk_size=4096)), status=resp.status_code, headers=response_headers)
+    else:
+        return (resp.content, resp.status_code, response_headers)
 
-# Login
-async def login(request):
-    return await proxy_request(request, "/session/login", method="POST")
+@app.route("/session/login", methods=["POST"])
+def session_login():
+    # Forward JSON body to device backend
+    return proxy_request("POST", "/session/login")
 
-# Logout
-async def logout(request):
-    return await proxy_request(request, "/session/logout", method="POST")
+@app.route("/session/logout", methods=["POST"])
+@require_auth
+def session_logout():
+    return proxy_request("POST", "/session/logout", auth_forward=True)
 
-# Schedules (GET/POST)
-async def get_schedules(request):
-    return await proxy_request(request, "/schedules", method="GET")
+@app.route("/schedules", methods=["GET", "POST"])
+@require_auth
+def schedules():
+    if request.method == "GET":
+        return proxy_request("GET", "/schedules", auth_forward=True)
+    elif request.method == "POST":
+        return proxy_request("POST", "/schedules", auth_forward=True)
 
-async def post_schedules(request):
-    return await proxy_request(request, "/schedules", method="POST")
+@app.route("/posts", methods=["GET", "POST"])
+@require_auth
+def posts():
+    if request.method == "GET":
+        return proxy_request("GET", "/posts", auth_forward=True)
+    elif request.method == "POST":
+        return proxy_request("POST", "/posts", auth_forward=True)
 
-# Posts (GET/POST)
-async def get_posts(request):
-    return await proxy_request(request, "/posts", method="GET")
+@app.route("/search", methods=["GET"])
+@require_auth
+def search():
+    return proxy_request("GET", "/search", auth_forward=True)
 
-async def post_posts(request):
-    return await proxy_request(request, "/posts", method="POST")
-
-# Search
-async def get_search(request):
-    return await proxy_request(request, "/search", method="GET")
-
-# Chats (GET/POST)
-async def get_chat_messages(request):
-    chat_id = request.match_info['chatId']
-    return await proxy_request(request, f"/chats/{chat_id}/messages", method="GET", extra_path_params={"chatId": chat_id})
-
-async def post_chat_messages(request):
-    chat_id = request.match_info['chatId']
-    return await proxy_request(request, f"/chats/{chat_id}/messages", method="POST", extra_path_params={"chatId": chat_id})
-
-# --- WebSocket Proxy Handler ---
-async def ws_handler(request):
-    ws_server = web.WebSocketResponse()
-    await ws_server.prepare(request)
-
-    ws_url = f"{DEVICE_PROTOCOL.replace('http', 'ws')}://{DEVICE_HOST}:{DEVICE_PORT}/ws"
-    async with ClientSession() as session:
-        async with session.ws_connect(ws_url) as ws_client:
-            async def ws_to_client():
-                async for msg in ws_client:
-                    if msg.type == WSMsgType.TEXT:
-                        await ws_server.send_str(msg.data)
-                    elif msg.type == WSMsgType.BINARY:
-                        await ws_server.send_bytes(msg.data)
-                    elif msg.type == WSMsgType.CLOSE:
-                        await ws_server.close()
-                        break
-
-            async def client_to_ws():
-                async for msg in ws_server:
-                    if msg.type == WSMsgType.TEXT:
-                        await ws_client.send_str(msg.data)
-                    elif msg.type == WSMsgType.BINARY:
-                        await ws_client.send_bytes(msg.data)
-                    elif msg.type == WSMsgType.CLOSE:
-                        await ws_client.close()
-                        break
-
-            await asyncio.gather(ws_to_client(), client_to_ws())
-
-    return ws_server
-
-# --- App Routing and Startup ---
-
-app = web.Application()
-app.router.add_post('/session/login', login)
-app.router.add_post('/session/logout', logout)
-app.router.add_get('/schedules', get_schedules)
-app.router.add_post('/schedules', post_schedules)
-app.router.add_get('/posts', get_posts)
-app.router.add_post('/posts', post_posts)
-app.router.add_get('/search', get_search)
-app.router.add_get('/chats/{chatId}/messages', get_chat_messages)
-app.router.add_post('/chats/{chatId}/messages', post_chat_messages)
-app.router.add_get('/ws', ws_handler)  # WebSocket endpoint proxy
+@app.route("/chats/<chat_id>/messages", methods=["GET", "POST"])
+@require_auth
+def chat_messages(chat_id):
+    path = f"/chats/{chat_id}/messages"
+    if request.method == "GET":
+        return proxy_request("GET", path, auth_forward=True)
+    elif request.method == "POST":
+        return proxy_request("POST", path, auth_forward=True)
 
 if __name__ == "__main__":
-    web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
+    app.run(host=SERVER_HOST, port=SERVER_PORT)
