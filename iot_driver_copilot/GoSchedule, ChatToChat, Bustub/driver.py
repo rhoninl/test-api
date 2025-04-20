@@ -1,149 +1,120 @@
 import os
 import json
-from urllib.parse import urlencode
 from functools import wraps
-
-from flask import Flask, request, Response, jsonify, stream_with_context
+from urllib.parse import urlencode
+from flask import Flask, request, jsonify, Response, stream_with_context
 import requests
 
-# Environment variables for configuration
-DEVICE_URL = os.environ.get('DEVICE_URL', 'http://localhost:8000')
+# --- Environment Configuration ---
+DEVICE_HOST = os.environ.get('DEVICE_HOST', 'localhost')
+DEVICE_PORT = os.environ.get('DEVICE_PORT', '8000')
 SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
 SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
+DEVICE_API_SCHEME = os.environ.get('DEVICE_API_SCHEME', 'http')  # http or https
 
-# Flask HTTP server
+DEVICE_BASE_URL = f"{DEVICE_API_SCHEME}://{DEVICE_HOST}:{DEVICE_PORT}"
+
 app = Flask(__name__)
 
-def get_token_from_headers():
-    auth = request.headers.get('Authorization')
-    if auth and auth.lower().startswith('bearer '):
-        return auth[7:]
-    return None
+# ----------- Session Management -----------
+# Simple in-memory session storage (token per browser session)
+# In production, replace with persistent storage or JWT tokens.
+active_sessions = {}
 
 def require_auth(f):
     @wraps(f)
     def decorated(*args, **kwargs):
-        token = get_token_from_headers()
-        if not token:
-            return jsonify({'error': 'Missing or invalid Authorization header'}), 401
-        return f(token, *args, **kwargs)
+        token = request.headers.get('Authorization', None)
+        if not token or token not in active_sessions.values():
+            return jsonify({"error": "Unauthorized"}), 401
+        return f(*args, **kwargs)
     return decorated
 
-# 1. POST /session/login
-@app.route('/session/login', methods=['POST'])
-def session_login():
-    try:
-        data = request.get_json(force=True)
-        r = requests.post(f'{DEVICE_URL}/session/login', json=data)
-        return (r.content, r.status_code, r.headers.items())
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+# ----------- API Proxy Endpoints -----------
 
-# 2. POST /session/logout
+@app.route('/session/login', methods=['POST'])
+def proxy_login():
+    # Forward login credentials to device backend, store token
+    credentials = request.get_json(force=True)
+    url = f"{DEVICE_BASE_URL}/session/login"
+    resp = requests.post(url, json=credentials)
+    if resp.status_code == 200:
+        data = resp.json()
+        token = data.get('token') or data.get('session_token') or data.get('access_token')
+        if token:
+            # Store session (here, simplistic, keyed by remote addr)
+            active_sessions[request.remote_addr] = token
+            # Return token to client
+            return jsonify({"token": token})
+    return Response(resp.content, status=resp.status_code, content_type=resp.headers.get('Content-Type', 'application/json'))
+
 @app.route('/session/logout', methods=['POST'])
 @require_auth
-def session_logout(token):
-    try:
-        headers = {'Authorization': f'Bearer {token}'}
-        r = requests.post(f'{DEVICE_URL}/session/logout', headers=headers)
-        return (r.content, r.status_code, r.headers.items())
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+def proxy_logout():
+    token = request.headers.get('Authorization')
+    url = f"{DEVICE_BASE_URL}/session/logout"
+    headers = {'Authorization': token}
+    resp = requests.post(url, headers=headers)
+    # Remove session from local store
+    active_sessions.pop(request.remote_addr, None)
+    return Response(resp.content, status=resp.status_code, content_type=resp.headers.get('Content-Type', 'application/json'))
 
-# 3. GET /schedules
-@app.route('/schedules', methods=['GET'])
+@app.route('/schedules', methods=['GET', 'POST'])
 @require_auth
-def get_schedules(token):
-    try:
-        headers = {'Authorization': f'Bearer {token}'}
-        r = requests.get(f'{DEVICE_URL}/schedules', headers=headers)
-        return (r.content, r.status_code, r.headers.items())
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+def proxy_schedules():
+    token = request.headers.get('Authorization')
+    url = f"{DEVICE_BASE_URL}/schedules"
+    headers = {'Authorization': token}
+    if request.method == 'GET':
+        resp = requests.get(url, headers=headers, params=request.args)
+    else:
+        resp = requests.post(url, headers=headers, json=request.get_json(force=True))
+    return Response(resp.content, status=resp.status_code, content_type=resp.headers.get('Content-Type', 'application/json'))
 
-# 4. POST /schedules
-@app.route('/schedules', methods=['POST'])
+@app.route('/posts', methods=['GET', 'POST'])
 @require_auth
-def post_schedules(token):
-    try:
-        headers = {'Authorization': f'Bearer {token}'}
-        data = request.get_json(force=True)
-        r = requests.post(f'{DEVICE_URL}/schedules', headers=headers, json=data)
-        return (r.content, r.status_code, r.headers.items())
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+def proxy_posts():
+    token = request.headers.get('Authorization')
+    url = f"{DEVICE_BASE_URL}/posts"
+    headers = {'Authorization': token}
+    if request.method == 'GET':
+        resp = requests.get(url, headers=headers, params=request.args)
+    else:
+        resp = requests.post(url, headers=headers, json=request.get_json(force=True))
+    return Response(resp.content, status=resp.status_code, content_type=resp.headers.get('Content-Type', 'application/json'))
 
-# 5. GET /posts
-@app.route('/posts', methods=['GET'])
-@require_auth
-def get_posts(token):
-    try:
-        headers = {'Authorization': f'Bearer {token}'}
-        query = request.query_string.decode()
-        url = f'{DEVICE_URL}/posts'
-        if query:
-            url += '?' + query
-        r = requests.get(url, headers=headers)
-        return (r.content, r.status_code, r.headers.items())
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-# 6. POST /posts
-@app.route('/posts', methods=['POST'])
-@require_auth
-def post_posts(token):
-    try:
-        headers = {'Authorization': f'Bearer {token}'}
-        data = request.get_json(force=True)
-        r = requests.post(f'{DEVICE_URL}/posts', headers=headers, json=data)
-        return (r.content, r.status_code, r.headers.items())
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-# 7. GET /search
 @app.route('/search', methods=['GET'])
 @require_auth
-def get_search(token):
-    try:
-        headers = {'Authorization': f'Bearer {token}'}
-        query = request.query_string.decode()
-        url = f'{DEVICE_URL}/search'
-        if query:
-            url += '?' + query
-        r = requests.get(url, headers=headers)
-        return (r.content, r.status_code, r.headers.items())
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+def proxy_search():
+    token = request.headers.get('Authorization')
+    url = f"{DEVICE_BASE_URL}/search"
+    headers = {'Authorization': token}
+    resp = requests.get(url, headers=headers, params=request.args)
+    return Response(resp.content, status=resp.status_code, content_type=resp.headers.get('Content-Type', 'application/json'))
 
-# 8. GET /chats/<chatId>/messages
-@app.route('/chats/<chatId>/messages', methods=['GET'])
+@app.route('/chats/<chat_id>/messages', methods=['GET', 'POST'])
 @require_auth
-def get_chat_messages(token, chatId):
-    try:
-        headers = {'Authorization': f'Bearer {token}'}
-        url = f'{DEVICE_URL}/chats/{chatId}/messages'
-        r = requests.get(url, headers=headers)
-        return (r.content, r.status_code, r.headers.items())
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+def proxy_chat_messages(chat_id):
+    token = request.headers.get('Authorization')
+    url = f"{DEVICE_BASE_URL}/chats/{chat_id}/messages"
+    headers = {'Authorization': token}
+    if request.method == 'GET':
+        # Stream messages if available
+        def generate():
+            with requests.get(url, headers=headers, params=request.args, stream=True) as resp:
+                for chunk in resp.iter_content(chunk_size=4096):
+                    if chunk:
+                        yield chunk
+        return Response(stream_with_context(generate()), content_type='application/json')
+    else:
+        resp = requests.post(url, headers=headers, json=request.get_json(force=True))
+        return Response(resp.content, status=resp.status_code, content_type=resp.headers.get('Content-Type', 'application/json'))
 
-# 9. POST /chats/<chatId>/messages
-@app.route('/chats/<chatId>/messages', methods=['POST'])
-@require_auth
-def post_chat_message(token, chatId):
-    try:
-        headers = {'Authorization': f'Bearer {token}'}
-        data = request.get_json(force=True)
-        url = f'{DEVICE_URL}/chats/{chatId}/messages'
-        r = requests.post(url, headers=headers, json=data)
-        return (r.content, r.status_code, r.headers.items())
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
-
-# Health check endpoint (optional)
+# ----------- Health Check -----------
 @app.route('/health', methods=['GET'])
 def health():
-    return jsonify({'status': 'ok'})
+    return jsonify({"status": "ok"}), 200
 
+# ----------- Main Entrypoint -----------
 if __name__ == '__main__':
-    app.run(host=SERVER_HOST, port=SERVER_PORT)
+    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
