@@ -1,142 +1,261 @@
 import os
 import json
-import asyncio
-from urllib.parse import urlencode
+import sys
+from urllib.parse import urljoin, urlencode
+from functools import wraps
 
-from aiohttp import web, ClientSession, WSMsgType
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import socketserver
 
-# Environment variables
-DEVICE_HOST = os.environ.get("DEVICE_HOST", "localhost")
-DEVICE_PORT = os.environ.get("DEVICE_PORT", "8080")
-DEVICE_USE_HTTPS = os.environ.get("DEVICE_USE_HTTPS", "false").lower() in ("1", "true", "yes")
-SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "8000"))
-WEBSOCKET_PORT = int(os.environ.get("WEBSOCKET_PORT", SERVER_PORT))  # same port unless overridden
+import threading
+import requests
 
-PROTOCOL = "https" if DEVICE_USE_HTTPS else "http"
-DEVICE_BASE_URL = f"{PROTOCOL}://{DEVICE_HOST}:{DEVICE_PORT}"
+DEVICE_HOST = os.environ.get('DEVICE_HOST', '127.0.0.1')
+DEVICE_PORT = int(os.environ.get('DEVICE_PORT', 8080))
+DEVICE_PROTOCOL = os.environ.get('DEVICE_PROTOCOL', 'http').lower()
 
-# Helper to forward REST requests
-async def forward_request(request, path, method=None, require_auth=False, stream=False):
-    url = DEVICE_BASE_URL + path
-    method = method or request.method
-    headers = dict(request.headers)
-    if "host" in headers:
-        del headers["host"]
-    data = None
-    if method in ("POST", "PUT", "PATCH"):
-        try:
-            data = await request.json()
-            data = json.dumps(data).encode()
-            headers["Content-Type"] = "application/json"
-        except Exception:
-            data = await request.read()
-    else:
+SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
+SERVER_PORT = int(os.environ.get('SERVER_PORT', 8000))
+
+DEVICE_BASE_URL = f"{DEVICE_PROTOCOL}://{DEVICE_HOST}:{DEVICE_PORT}"
+
+API_MAP = {
+    ('POST', '/session/login'): {
+        'device_path': '/session/login',
+        'headers': {'Content-Type': 'application/json'},
+        'auth': False,
+        'request_body': True,
+        'path_params': [],
+        'query_params': []
+    },
+    ('POST', '/session/logout'): {
+        'device_path': '/session/logout',
+        'headers': {'Content-Type': 'application/json'},
+        'auth': True,
+        'request_body': False,
+        'path_params': [],
+        'query_params': []
+    },
+    ('GET', '/schedules'): {
+        'device_path': '/schedules',
+        'headers': {},
+        'auth': True,
+        'request_body': False,
+        'path_params': [],
+        'query_params': []
+    },
+    ('POST', '/schedules'): {
+        'device_path': '/schedules',
+        'headers': {'Content-Type': 'application/json'},
+        'auth': True,
+        'request_body': True,
+        'path_params': [],
+        'query_params': []
+    },
+    ('GET', '/posts'): {
+        'device_path': '/posts',
+        'headers': {},
+        'auth': True,
+        'request_body': False,
+        'path_params': [],
+        'query_params': ['page']
+    },
+    ('POST', '/posts'): {
+        'device_path': '/posts',
+        'headers': {'Content-Type': 'application/json'},
+        'auth': True,
+        'request_body': True,
+        'path_params': [],
+        'query_params': []
+    },
+    ('GET', '/search'): {
+        'device_path': '/search',
+        'headers': {},
+        'auth': True,
+        'request_body': False,
+        'path_params': [],
+        'query_params': ['q']
+    },
+    ('GET', '/chats/{chatId}/messages'): {
+        'device_path': '/chats/{chatId}/messages',
+        'headers': {},
+        'auth': True,
+        'request_body': False,
+        'path_params': ['chatId'],
+        'query_params': []
+    },
+    ('POST', '/chats/{chatId}/messages'): {
+        'device_path': '/chats/{chatId}/messages',
+        'headers': {'Content-Type': 'application/json'},
+        'auth': True,
+        'request_body': True,
+        'path_params': ['chatId'],
+        'query_params': []
+    }
+}
+
+def parse_path(path):
+    for (method, api_path), spec in API_MAP.items():
+        if '{' in api_path:
+            parts_api = api_path.strip('/').split('/')
+            parts_path = path.strip('/').split('/')
+            if len(parts_api) != len(parts_path):
+                continue
+            params = {}
+            matched = True
+            for api, actual in zip(parts_api, parts_path):
+                if api.startswith('{') and api.endswith('}'):
+                    params[api[1:-1]] = actual
+                elif api != actual:
+                    matched = False
+                    break
+            if matched:
+                return (method, api_path, params)
+        elif path == api_path:
+            return (method, api_path, {})
+    return (None, None, None)
+
+def require_auth(func):
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        if hasattr(self, 'token') and self.token:
+            return func(self, *args, **kwargs)
+        else:
+            self.send_response(401)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(b'{"error":"Unauthorized"}')
+    return wrapper
+
+class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+class DeviceProxyHandler(BaseHTTPRequestHandler):
+    # Session token cache, thread safe
+    tokens = {}
+    lock = threading.Lock()
+
+    def do_OPTIONS(self):
+        self.send_response(200)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
+        self.send_header('Access-Control-Allow-Headers', 'Authorization, Content-Type')
+        self.end_headers()
+
+    def do_GET(self):
+        self.handle_proxy('GET')
+
+    def do_POST(self):
+        self.handle_proxy('POST')
+
+    def _get_token(self):
+        auth = self.headers.get('Authorization', '')
+        if auth.startswith('Bearer '):
+            return auth[7:]
+        return None
+
+    def _set_token(self, token):
+        # Optionally store token per client (by IP)
+        with self.lock:
+            self.tokens[self.client_address[0]] = token
+
+    def _get_stored_token(self):
+        with self.lock:
+            return self.tokens.get(self.client_address[0])
+
+    def handle_proxy(self, method):
+        # Parse path and params
+        base_path = self.path.split('?', 1)[0]
+        query_string = self.path.split('?', 1)[1] if '?' in self.path else ''
+        method_key, api_path, path_params = parse_path(base_path)
+        if method_key != method:
+            self.send_response(404)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(b'{"error":"Not found"}')
+            return
+
+        spec = API_MAP[(method, api_path)]
+        device_path = spec['device_path']
+        # Fill path params if needed
+        for param in spec.get('path_params', []):
+            if param in path_params:
+                device_path = device_path.replace(f'{{{param}}}', path_params[param])
+
+        # Prepare headers
+        headers = dict(spec.get('headers', {}))
+        # Token management
+        token = self._get_token()
+        if not token and spec['auth']:
+            token = self._get_stored_token()
+        if token and spec['auth']:
+            headers['Authorization'] = f'Bearer {token}'
+
+        # Proxy request to device
+        url = urljoin(DEVICE_BASE_URL, device_path)
+        if spec.get('query_params'):
+            query = {}
+            for k in spec['query_params']:
+                if k in self._get_query_params():
+                    query[k] = self._get_query_params()[k]
+            if query:
+                url += '?' + urlencode(query)
+
         data = None
-    # Auth token forwarding
-    if require_auth:
-        token = request.headers.get("Authorization")
-        if token:
-            headers["Authorization"] = token
-    params = request.rel_url.query
-    async with ClientSession() as session:
-        async with session.request(method, url, headers=headers, params=params, data=data) as resp:
-            if stream:
-                response = web.StreamResponse(status=resp.status, reason=resp.reason, headers=resp.headers)
-                await response.prepare(request)
-                async for chunk in resp.content.iter_chunked(4096):
-                    await response.write(chunk)
-                await response.write_eof()
-                return response
-            else:
-                body = await resp.read()
-                try:
-                    json_body = json.loads(body)
-                    return web.json_response(json_body, status=resp.status)
-                except Exception:
-                    return web.Response(body=body, status=resp.status, content_type=resp.headers.get("Content-Type"))
+        if method == 'POST' and spec.get('request_body', False):
+            length = int(self.headers.get('Content-Length', 0))
+            data = self.rfile.read(length) if length else None
 
-# RESTful HTTP handlers
-routes = web.RouteTableDef()
-
-@routes.post("/session/login")
-async def login(request):
-    return await forward_request(request, "/session/login", method="POST")
-
-@routes.post("/session/logout")
-async def logout(request):
-    return await forward_request(request, "/session/logout", method="POST", require_auth=True)
-
-@routes.get("/schedules")
-async def get_schedules(request):
-    return await forward_request(request, "/schedules", method="GET", require_auth=True)
-
-@routes.post("/schedules")
-async def create_schedule(request):
-    return await forward_request(request, "/schedules", method="POST", require_auth=True)
-
-@routes.get("/posts")
-async def get_posts(request):
-    return await forward_request(request, "/posts", method="GET", require_auth=True)
-
-@routes.post("/posts")
-async def create_post(request):
-    return await forward_request(request, "/posts", method="POST", require_auth=True)
-
-@routes.get("/search")
-async def search(request):
-    return await forward_request(request, "/search", method="GET", require_auth=True)
-
-@routes.get("/chats/{chatId}/messages")
-async def get_chat_messages(request):
-    chatId = request.match_info["chatId"]
-    return await forward_request(request, f"/chats/{chatId}/messages", method="GET", require_auth=True)
-
-@routes.post("/chats/{chatId}/messages")
-async def post_chat_message(request):
-    chatId = request.match_info["chatId"]
-    return await forward_request(request, f"/chats/{chatId}/messages", method="POST", require_auth=True)
-
-# WebSocket Proxy Handler
-async def websocket_handler(request):
-    # Accept query param: path=/ws/...
-    device_ws_path = request.rel_url.query.get("path", "/ws")
-    device_ws_url = f"{'wss' if DEVICE_USE_HTTPS else 'ws'}://{DEVICE_HOST}:{DEVICE_PORT}{device_ws_path}"
-    ws_server = web.WebSocketResponse()
-    await ws_server.prepare(request)
-
-    async with ClientSession() as session:
         try:
-            async with session.ws_connect(device_ws_url) as ws_client:
-                async def ws_to_client():
-                    async for msg in ws_client:
-                        if msg.type == WSMsgType.TEXT:
-                            await ws_server.send_str(msg.data)
-                        elif msg.type == WSMsgType.BINARY:
-                            await ws_server.send_bytes(msg.data)
-                        elif msg.type == WSMsgType.CLOSE:
-                            await ws_server.close()
-                            break
+            resp = requests.request(
+                method,
+                url,
+                headers=headers,
+                data=data,
+                timeout=10
+            )
+        except requests.RequestException as e:
+            self.send_response(502)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({'error': 'Device unavailable', 'detail': str(e)}).encode())
+            return
 
-                async def client_to_ws():
-                    async for msg in ws_server:
-                        if msg.type == WSMsgType.TEXT:
-                            await ws_client.send_str(msg.data)
-                        elif msg.type == WSMsgType.BINARY:
-                            await ws_client.send_bytes(msg.data)
-                        elif msg.type == WSMsgType.CLOSE:
-                            await ws_client.close()
-                            break
+        # For login, store token from response
+        if method == 'POST' and api_path == '/session/login' and resp.status_code == 200:
+            try:
+                payload = resp.json()
+            except:
+                payload = {}
+            token = payload.get('token') or payload.get('session_token')
+            if token:
+                self._set_token(token)
 
-                await asyncio.gather(ws_to_client(), client_to_ws())
-        except Exception as e:
-            await ws_server.close(message=str(e).encode())
-    return ws_server
+        self.send_response(resp.status_code)
+        for k, v in resp.headers.items():
+            if k.lower() not in ['content-length', 'connection', 'content-encoding', 'transfer-encoding']:
+                self.send_header(k, v)
+        self.send_header('Access-Control-Allow-Origin', '*')
+        self.end_headers()
+        self.wfile.write(resp.content)
 
-# Attach WebSocket endpoint, only if WEBSOCKET_PORT is set and nonzero
-app = web.Application()
-app.add_routes(routes)
-app.router.add_get("/wsproxy", websocket_handler)
+    def _get_query_params(self):
+        params = {}
+        if '?' in self.path:
+            qs = self.path.split('?', 1)[1]
+            for kv in qs.split('&'):
+                if '=' in kv:
+                    k, v = kv.split('=', 1)
+                    params[k] = v
+        return params
 
-if __name__ == "__main__":
-    web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
+def run():
+    server = ThreadedHTTPServer((SERVER_HOST, SERVER_PORT), DeviceProxyHandler)
+    print(f"HTTP proxy driver running on {SERVER_HOST}:{SERVER_PORT}, proxying to {DEVICE_BASE_URL}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+if __name__ == '__main__':
+    run()
