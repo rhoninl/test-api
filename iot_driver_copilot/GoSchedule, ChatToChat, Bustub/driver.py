@@ -1,116 +1,153 @@
 import os
 import json
+import sys
 from urllib.parse import urlencode
 from functools import wraps
 
-from flask import Flask, request, Response, jsonify, stream_with_context
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+import threading
 import requests
 
-app = Flask(__name__)
+DEVICE_HOST = os.environ.get('DEVICE_HOST', '127.0.0.1')
+DEVICE_PORT = os.environ.get('DEVICE_PORT', '8080')
+DEVICE_PROTOCOL = os.environ.get('DEVICE_PROTOCOL', 'http')
+SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
+SERVER_PORT = int(os.environ.get('SERVER_PORT', '8000'))
 
-# Environment Variable Configuration
-DEVICE_HOST = os.environ.get("DEVICE_HOST", "localhost")
-DEVICE_PORT = os.environ.get("DEVICE_PORT", "8000")
-SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "5000"))
-DEVICE_PROTOCOL = os.environ.get("DEVICE_PROTOCOL", "http")  # http or https
+DEVICE_BASE_URL = f"{DEVICE_PROTOCOL}://{DEVICE_HOST}:{DEVICE_PORT}"
 
-DEVICE_BASE = f"{DEVICE_PROTOCOL}://{DEVICE_HOST}:{DEVICE_PORT}"
+API_PATHS = {
+    "login":         {"method": "POST", "path": "/session/login"},
+    "logout":        {"method": "POST", "path": "/session/logout"},
+    "get_schedules": {"method": "GET",  "path": "/schedules"},
+    "post_schedule": {"method": "POST", "path": "/schedules"},
+    "get_posts":     {"method": "GET",  "path": "/posts"},
+    "post_post":     {"method": "POST", "path": "/posts"},
+    "search":        {"method": "GET",  "path": "/search"},
+    "get_chat":      {"method": "GET",  "path": "/chats/{chatId}/messages"},
+    "post_chat":     {"method": "POST", "path": "/chats/{chatId}/messages"},
+}
 
-# Helper: Proxy request to device, stream response if wanted
-def proxy_request(method, path, stream=False, token=None, data=None, params=None, headers=None):
-    url = DEVICE_BASE + path
-    req_headers = dict(headers) if headers else {}
-    if token:
-        req_headers['Authorization'] = f"Bearer {token}"
-    payload = None
-    if data:
-        payload = json.dumps(data)
-        req_headers['Content-Type'] = 'application/json'
-    resp = requests.request(method, url, headers=req_headers, params=params, data=payload, stream=stream)
-    if stream:
-        def generate():
-            for chunk in resp.iter_content(chunk_size=4096):
-                if chunk:
-                    yield chunk
-        return Response(stream_with_context(generate()), status=resp.status_code, content_type=resp.headers.get('Content-Type'))
-    else:
-        return Response(resp.content, status=resp.status_code, content_type=resp.headers.get('Content-Type'))
+def get_auth_token(headers):
+    auth = headers.get('Authorization')
+    if auth and auth.lower().startswith('bearer '):
+        return auth[7:]
+    return auth
 
-# Decorator to extract token from Authorization header
-def require_token(fn):
-    @wraps(fn)
-    def wrapper(*args, **kwargs):
-        auth = request.headers.get('Authorization', '')
-        token = None
-        if auth.startswith('Bearer '):
-            token = auth.split(' ', 1)[1]
-        return fn(token, *args, **kwargs)
+def require_auth(func):
+    @wraps(func)
+    def wrapper(self, *args, **kwargs):
+        token = self.headers.get('Authorization')
+        if not token:
+            self.send_response(401)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(json.dumps({"error": "Missing Authorization header"}).encode())
+            return
+        return func(self, *args, **kwargs)
     return wrapper
 
-# 1. POST /session/login
-@app.route('/session/login', methods=['POST'])
-def session_login():
-    data = request.get_json(force=True)
-    return proxy_request('POST', '/session/login', data=data)
+class ProxyHTTPRequestHandler(BaseHTTPRequestHandler):
+    protocol_version = 'HTTP/1.1'
 
-# 2. POST /session/logout
-@app.route('/session/logout', methods=['POST'])
-@require_token
-def session_logout(token):
-    return proxy_request('POST', '/session/logout', token=token)
+    def _set_headers(self, status=200, extra_headers=None):
+        self.send_response(status)
+        self.send_header('Content-Type', 'application/json')
+        if extra_headers:
+            for k, v in extra_headers.items():
+                self.send_header(k, v)
+        self.end_headers()
 
-# 3. GET /schedules
-@app.route('/schedules', methods=['GET'])
-@require_token
-def get_schedules(token):
-    return proxy_request('GET', '/schedules', token=token, params=request.args)
+    def _forward_request(self, api_key, path_vars=None, query_vars=None, require_auth_token=False):
+        api = API_PATHS[api_key]
+        method = api['method']
+        path = api['path']
+        if path_vars:
+            path = path.format(**path_vars)
+        url = DEVICE_BASE_URL + path
+        if query_vars:
+            url = f"{url}?{urlencode(query_vars)}"
+        headers = {}
+        if require_auth_token:
+            token = self.headers.get('Authorization')
+            if token:
+                headers['Authorization'] = token
+        if method in ['POST', 'PUT', 'PATCH']:
+            content_length = int(self.headers.get('Content-Length', 0))
+            post_data = self.rfile.read(content_length) if content_length > 0 else b''
+            try:
+                json_data = json.loads(post_data.decode()) if post_data else {}
+            except Exception:
+                self._set_headers(400)
+                self.wfile.write(json.dumps({"error": "Invalid JSON"}).encode())
+                return
+            resp = requests.request(method, url, headers=headers, json=json_data)
+        else:
+            resp = requests.request(method, url, headers=headers)
+        self._set_headers(resp.status_code)
+        self.wfile.write(resp.content)
 
-# 4. POST /schedules
-@app.route('/schedules', methods=['POST'])
-@require_token
-def post_schedules(token):
-    data = request.get_json(force=True)
-    return proxy_request('POST', '/schedules', token=token, data=data)
+    def do_POST(self):
+        if self.path == "/session/login":
+            self._forward_request("login")
+        elif self.path == "/session/logout":
+            self._forward_request("logout", require_auth_token=True)
+        elif self.path == "/schedules":
+            self._forward_request("post_schedule", require_auth_token=True)
+        elif self.path == "/posts":
+            self._forward_request("post_post", require_auth_token=True)
+        elif self.path.startswith("/chats/") and self.path.endswith("/messages"):
+            chat_id = self.path.split('/')[2]
+            self._forward_request("post_chat", path_vars={"chatId": chat_id}, require_auth_token=True)
+        else:
+            self._set_headers(404)
+            self.wfile.write(json.dumps({"error": "Not found"}).encode())
 
-# 5. GET /posts
-@app.route('/posts', methods=['GET'])
-@require_token
-def get_posts(token):
-    return proxy_request('GET', '/posts', token=token, params=request.args)
+    def do_GET(self):
+        if self.path == "/schedules":
+            self._forward_request("get_schedules", require_auth_token=True)
+        elif self.path.startswith("/posts"):
+            # Support query ?page=2
+            if '?' in self.path:
+                base, query = self.path.split('?', 1)
+                q_dict = dict(item.split('=') for item in query.split('&') if '=' in item)
+            else:
+                q_dict = {}
+            self._forward_request("get_posts", query_vars=q_dict, require_auth_token=True)
+        elif self.path.startswith("/search"):
+            if '?' in self.path:
+                base, query = self.path.split('?', 1)
+                q_dict = dict(item.split('=') for item in query.split('&') if '=' in item)
+            else:
+                q_dict = {}
+            self._forward_request("search", query_vars=q_dict, require_auth_token=True)
+        elif self.path.startswith("/chats/") and self.path.endswith("/messages"):
+            chat_id = self.path.split('/')[2]
+            self._forward_request("get_chat", path_vars={"chatId": chat_id}, require_auth_token=True)
+        else:
+            self._set_headers(404)
+            self.wfile.write(json.dumps({"error": "Not found"}).encode())
 
-# 6. POST /posts
-@app.route('/posts', methods=['POST'])
-@require_token
-def post_posts(token):
-    data = request.get_json(force=True)
-    return proxy_request('POST', '/posts', token=token, data=data)
+    def log_message(self, format, *args):
+        # Optional: comment out to silence logs
+        sys.stderr.write("%s - - [%s] %s\n" %
+                         (self.client_address[0],
+                          self.log_date_time_string(),
+                          format % args))
 
-# 7. GET /search
-@app.route('/search', methods=['GET'])
-@require_token
-def get_search(token):
-    return proxy_request('GET', '/search', token=token, params=request.args)
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
 
-# 8. GET /chats/<chatId>/messages
-@app.route('/chats/<chatId>/messages', methods=['GET'])
-@require_token
-def get_chat_messages(token, chatId):
-    path = f"/chats/{chatId}/messages"
-    return proxy_request('GET', path, token=token, params=request.args)
+def run():
+    server_address = (SERVER_HOST, SERVER_PORT)
+    httpd = ThreadedHTTPServer(server_address, ProxyHTTPRequestHandler)
+    print(f"Driver HTTP server running at http://{SERVER_HOST}:{SERVER_PORT}/")
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        pass
+    httpd.server_close()
 
-# 9. POST /chats/<chatId>/messages
-@app.route('/chats/<chatId>/messages', methods=['POST'])
-@require_token
-def post_chat_messages(token, chatId):
-    data = request.get_json(force=True)
-    path = f"/chats/{chatId}/messages"
-    return proxy_request('POST', path, token=token, data=data)
-
-# Health check
-@app.route('/', methods=['GET'])
-def health():
-    return jsonify({"status": "GoSchedule driver running"})
-
-if __name__ == "__main__":
-    app.run(host=SERVER_HOST, port=SERVER_PORT)
+if __name__ == '__main__':
+    run()
