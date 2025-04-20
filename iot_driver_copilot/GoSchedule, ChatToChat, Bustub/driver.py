@@ -1,261 +1,150 @@
 import os
 import json
-import sys
-from urllib.parse import urljoin, urlencode
-from functools import wraps
+import asyncio
+from typing import Optional, Dict, Any
+from fastapi import FastAPI, Request, Response, WebSocket, WebSocketDisconnect, HTTPException, status, Header, Depends
+from fastapi.responses import JSONResponse
+from fastapi.middleware.cors import CORSMiddleware
+import httpx
 
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import socketserver
-
-import threading
-import requests
-
-DEVICE_HOST = os.environ.get('DEVICE_HOST', '127.0.0.1')
-DEVICE_PORT = int(os.environ.get('DEVICE_PORT', 8080))
-DEVICE_PROTOCOL = os.environ.get('DEVICE_PROTOCOL', 'http').lower()
-
-SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.environ.get('SERVER_PORT', 8000))
-
+# Environment variables for configuration
+DEVICE_HOST = os.environ.get("DEVICE_HOST", "localhost")
+DEVICE_PORT = os.environ.get("DEVICE_PORT", "8080")
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8000"))
+DEVICE_PROTOCOL = os.environ.get("DEVICE_PROTOCOL", "http").lower()
 DEVICE_BASE_URL = f"{DEVICE_PROTOCOL}://{DEVICE_HOST}:{DEVICE_PORT}"
 
-API_MAP = {
-    ('POST', '/session/login'): {
-        'device_path': '/session/login',
-        'headers': {'Content-Type': 'application/json'},
-        'auth': False,
-        'request_body': True,
-        'path_params': [],
-        'query_params': []
-    },
-    ('POST', '/session/logout'): {
-        'device_path': '/session/logout',
-        'headers': {'Content-Type': 'application/json'},
-        'auth': True,
-        'request_body': False,
-        'path_params': [],
-        'query_params': []
-    },
-    ('GET', '/schedules'): {
-        'device_path': '/schedules',
-        'headers': {},
-        'auth': True,
-        'request_body': False,
-        'path_params': [],
-        'query_params': []
-    },
-    ('POST', '/schedules'): {
-        'device_path': '/schedules',
-        'headers': {'Content-Type': 'application/json'},
-        'auth': True,
-        'request_body': True,
-        'path_params': [],
-        'query_params': []
-    },
-    ('GET', '/posts'): {
-        'device_path': '/posts',
-        'headers': {},
-        'auth': True,
-        'request_body': False,
-        'path_params': [],
-        'query_params': ['page']
-    },
-    ('POST', '/posts'): {
-        'device_path': '/posts',
-        'headers': {'Content-Type': 'application/json'},
-        'auth': True,
-        'request_body': True,
-        'path_params': [],
-        'query_params': []
-    },
-    ('GET', '/search'): {
-        'device_path': '/search',
-        'headers': {},
-        'auth': True,
-        'request_body': False,
-        'path_params': [],
-        'query_params': ['q']
-    },
-    ('GET', '/chats/{chatId}/messages'): {
-        'device_path': '/chats/{chatId}/messages',
-        'headers': {},
-        'auth': True,
-        'request_body': False,
-        'path_params': ['chatId'],
-        'query_params': []
-    },
-    ('POST', '/chats/{chatId}/messages'): {
-        'device_path': '/chats/{chatId}/messages',
-        'headers': {'Content-Type': 'application/json'},
-        'auth': True,
-        'request_body': True,
-        'path_params': ['chatId'],
-        'query_params': []
-    }
-}
+# FastAPI app setup
+app = FastAPI(title="GoSchedule ChatToChat Bustub Driver")
 
-def parse_path(path):
-    for (method, api_path), spec in API_MAP.items():
-        if '{' in api_path:
-            parts_api = api_path.strip('/').split('/')
-            parts_path = path.strip('/').split('/')
-            if len(parts_api) != len(parts_path):
-                continue
-            params = {}
-            matched = True
-            for api, actual in zip(parts_api, parts_path):
-                if api.startswith('{') and api.endswith('}'):
-                    params[api[1:-1]] = actual
-                elif api != actual:
-                    matched = False
-                    break
-            if matched:
-                return (method, api_path, params)
-        elif path == api_path:
-            return (method, api_path, {})
-    return (None, None, None)
+# Allow CORS for browser and CLI access
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
-def require_auth(func):
-    @wraps(func)
-    def wrapper(self, *args, **kwargs):
-        if hasattr(self, 'token') and self.token:
-            return func(self, *args, **kwargs)
-        else:
-            self.send_response(401)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(b'{"error":"Unauthorized"}')
-    return wrapper
+# --- AUTH HANDLING ---
 
-class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
-    daemon_threads = True
+async def get_auth_token(authorization: Optional[str] = Header(None)):
+    if not authorization:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Authorization header missing")
+    return authorization
 
-class DeviceProxyHandler(BaseHTTPRequestHandler):
-    # Session token cache, thread safe
-    tokens = {}
-    lock = threading.Lock()
+# --- SESSION LOGIN ---
 
-    def do_OPTIONS(self):
-        self.send_response(200)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.send_header('Access-Control-Allow-Methods', 'GET, POST, OPTIONS')
-        self.send_header('Access-Control-Allow-Headers', 'Authorization, Content-Type')
-        self.end_headers()
+@app.post("/session/login")
+async def session_login(request: Request):
+    body = await request.json()
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(f"{DEVICE_BASE_URL}/session/login", json=body)
+        return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get('content-type', 'application/json'))
 
-    def do_GET(self):
-        self.handle_proxy('GET')
+# --- SESSION LOGOUT ---
 
-    def do_POST(self):
-        self.handle_proxy('POST')
+@app.post("/session/logout")
+async def session_logout(authorization: str = Depends(get_auth_token)):
+    headers = {"Authorization": authorization}
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(f"{DEVICE_BASE_URL}/session/logout", headers=headers)
+        return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get('content-type', 'application/json'))
 
-    def _get_token(self):
-        auth = self.headers.get('Authorization', '')
-        if auth.startswith('Bearer '):
-            return auth[7:]
-        return None
+# --- FETCH SCHEDULES ---
 
-    def _set_token(self, token):
-        # Optionally store token per client (by IP)
-        with self.lock:
-            self.tokens[self.client_address[0]] = token
+@app.get("/schedules")
+async def get_schedules(authorization: str = Depends(get_auth_token)):
+    headers = {"Authorization": authorization}
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(f"{DEVICE_BASE_URL}/schedules", headers=headers)
+        return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get('content-type', 'application/json'))
 
-    def _get_stored_token(self):
-        with self.lock:
-            return self.tokens.get(self.client_address[0])
+@app.post("/schedules")
+async def create_schedule(request: Request, authorization: str = Depends(get_auth_token)):
+    body = await request.json()
+    headers = {"Authorization": authorization}
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(f"{DEVICE_BASE_URL}/schedules", json=body, headers=headers)
+        return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get('content-type', 'application/json'))
 
-    def handle_proxy(self, method):
-        # Parse path and params
-        base_path = self.path.split('?', 1)[0]
-        query_string = self.path.split('?', 1)[1] if '?' in self.path else ''
-        method_key, api_path, path_params = parse_path(base_path)
-        if method_key != method:
-            self.send_response(404)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(b'{"error":"Not found"}')
-            return
+# --- POSTS ---
 
-        spec = API_MAP[(method, api_path)]
-        device_path = spec['device_path']
-        # Fill path params if needed
-        for param in spec.get('path_params', []):
-            if param in path_params:
-                device_path = device_path.replace(f'{{{param}}}', path_params[param])
+@app.get("/posts")
+async def get_posts(request: Request, authorization: str = Depends(get_auth_token)):
+    headers = {"Authorization": authorization}
+    params = dict(request.query_params)
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(f"{DEVICE_BASE_URL}/posts", headers=headers, params=params)
+        return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get('content-type', 'application/json'))
 
-        # Prepare headers
-        headers = dict(spec.get('headers', {}))
-        # Token management
-        token = self._get_token()
-        if not token and spec['auth']:
-            token = self._get_stored_token()
-        if token and spec['auth']:
-            headers['Authorization'] = f'Bearer {token}'
+@app.post("/posts")
+async def create_post(request: Request, authorization: str = Depends(get_auth_token)):
+    body = await request.json()
+    headers = {"Authorization": authorization}
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(f"{DEVICE_BASE_URL}/posts", json=body, headers=headers)
+        return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get('content-type', 'application/json'))
 
-        # Proxy request to device
-        url = urljoin(DEVICE_BASE_URL, device_path)
-        if spec.get('query_params'):
-            query = {}
-            for k in spec['query_params']:
-                if k in self._get_query_params():
-                    query[k] = self._get_query_params()[k]
-            if query:
-                url += '?' + urlencode(query)
+# --- SEARCH ---
 
-        data = None
-        if method == 'POST' and spec.get('request_body', False):
-            length = int(self.headers.get('Content-Length', 0))
-            data = self.rfile.read(length) if length else None
+@app.get("/search")
+async def search(request: Request, authorization: str = Depends(get_auth_token)):
+    headers = {"Authorization": authorization}
+    params = dict(request.query_params)
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(f"{DEVICE_BASE_URL}/search", headers=headers, params=params)
+        return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get('content-type', 'application/json'))
 
+# --- CHATS ---
+
+@app.get("/chats/{chatId}/messages")
+async def get_chat_messages(chatId: str, authorization: str = Depends(get_auth_token)):
+    headers = {"Authorization": authorization}
+    async with httpx.AsyncClient() as client:
+        resp = await client.get(f"{DEVICE_BASE_URL}/chats/{chatId}/messages", headers=headers)
+        return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get('content-type', 'application/json'))
+
+@app.post("/chats/{chatId}/messages")
+async def send_chat_message(chatId: str, request: Request, authorization: str = Depends(get_auth_token)):
+    body = await request.json()
+    headers = {"Authorization": authorization}
+    async with httpx.AsyncClient() as client:
+        resp = await client.post(f"{DEVICE_BASE_URL}/chats/{chatId}/messages", json=body, headers=headers)
+        return Response(content=resp.content, status_code=resp.status_code, media_type=resp.headers.get('content-type', 'application/json'))
+
+# --- WEBSOCKET PROXY SUPPORT ---
+
+# Proxy WebSocket connections to backend WebSocket if requested
+@app.websocket("/ws/{path:path}")
+async def websocket_proxy(websocket: WebSocket, path: str):
+    await websocket.accept()
+    backend_ws_url = f"ws://{DEVICE_HOST}:{DEVICE_PORT}/ws/{path}"
+    async with httpx.AsyncClient() as client:
         try:
-            resp = requests.request(
-                method,
-                url,
-                headers=headers,
-                data=data,
-                timeout=10
-            )
-        except requests.RequestException as e:
-            self.send_response(502)
-            self.send_header('Content-Type', 'application/json')
-            self.end_headers()
-            self.wfile.write(json.dumps({'error': 'Device unavailable', 'detail': str(e)}).encode())
-            return
+            async with client.ws_connect(backend_ws_url) as backend_ws:
+                async def to_backend():
+                    try:
+                        while True:
+                            data = await websocket.receive_text()
+                            await backend_ws.send_text(data)
+                    except WebSocketDisconnect:
+                        await backend_ws.close()
+                    except Exception:
+                        await backend_ws.close()
+                async def from_backend():
+                    try:
+                        async for msg in backend_ws.iter_text():
+                            await websocket.send_text(msg)
+                    except Exception:
+                        await websocket.close()
+                await asyncio.gather(to_backend(), from_backend())
+        except Exception:
+            await websocket.close()
 
-        # For login, store token from response
-        if method == 'POST' and api_path == '/session/login' and resp.status_code == 200:
-            try:
-                payload = resp.json()
-            except:
-                payload = {}
-            token = payload.get('token') or payload.get('session_token')
-            if token:
-                self._set_token(token)
+# --- MAIN ENTRY POINT ---
 
-        self.send_response(resp.status_code)
-        for k, v in resp.headers.items():
-            if k.lower() not in ['content-length', 'connection', 'content-encoding', 'transfer-encoding']:
-                self.send_header(k, v)
-        self.send_header('Access-Control-Allow-Origin', '*')
-        self.end_headers()
-        self.wfile.write(resp.content)
-
-    def _get_query_params(self):
-        params = {}
-        if '?' in self.path:
-            qs = self.path.split('?', 1)[1]
-            for kv in qs.split('&'):
-                if '=' in kv:
-                    k, v = kv.split('=', 1)
-                    params[k] = v
-        return params
-
-def run():
-    server = ThreadedHTTPServer((SERVER_HOST, SERVER_PORT), DeviceProxyHandler)
-    print(f"HTTP proxy driver running on {SERVER_HOST}:{SERVER_PORT}, proxying to {DEVICE_BASE_URL}")
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-
-if __name__ == '__main__':
-    run()
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run("driver:app", host=SERVER_HOST, port=SERVER_PORT, reload=False)
