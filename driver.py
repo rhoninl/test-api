@@ -1,162 +1,132 @@
 import os
-import uvicorn
 import json
-import requests
-from fastapi import FastAPI, Request, HTTPException, Header
-from fastapi.responses import JSONResponse
-from fastapi.middleware.cors import CORSMiddleware
+import asyncio
+from urllib.parse import urlencode, urljoin
+from aiohttp import ClientSession, web, WSMsgType
 
-# Configuration from environment variables
 DEVICE_HOST = os.environ.get("DEVICE_HOST", "localhost")
-DEVICE_PORT = int(os.environ.get("DEVICE_PORT", 80))
+DEVICE_PORT = os.environ.get("DEVICE_PORT", "8080")
 DEVICE_PROTOCOL = os.environ.get("DEVICE_PROTOCOL", "http")
 SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", 8080))
-SERVER_USE_HTTPS = os.environ.get("SERVER_USE_HTTPS", "false").lower() == "true"
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8000"))
 
-# Construct base URL for device
-if DEVICE_PROTOCOL == "http":
-    BASE_URL = f"http://{DEVICE_HOST}:{DEVICE_PORT}"
-elif DEVICE_PROTOCOL == "https":
-    BASE_URL = f"https://{DEVICE_HOST}:{DEVICE_PORT}"
-else:
-    raise RuntimeError("Unsupported DEVICE_PROTOCOL. Only http and https are supported.")
+BASE_URL = f"{DEVICE_PROTOCOL}://{DEVICE_HOST}:{DEVICE_PORT}"
 
-app = FastAPI(
-    title="GoSchedule/ChatToChat/Bustub HTTP Proxy Driver",
-    description="HTTP driver to proxy backend software service APIs for GoSchedule, ChatToChat, Bustub.",
-    version="1.0.0",
-)
+# --- HTTP REST Proxy Handlers ---
 
-# Enable CORS for browser access
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+async def proxy_request(request, path, method="GET", json_body=False, extra_path_params=None):
+    url = urljoin(BASE_URL, path)
+    if extra_path_params:
+        url = url.format(**extra_path_params)
+    headers = dict(request.headers)
+    if "Host" in headers:
+        del headers["Host"]
 
-def _api_headers(token: str = None, extra: dict = None):
-    headers = {"Content-Type": "application/json"}
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    if extra:
-        headers.update(extra)
-    return headers
+    params = dict(request.query)
+    data = None
+    if request.method in {"POST", "PUT", "PATCH"}:
+        try:
+            data = await request.json()
+        except Exception:
+            data = await request.text()
+    async with ClientSession() as session:
+        req_args = {
+            "headers": headers,
+            "params": params,
+        }
+        if data:
+            if isinstance(data, dict):
+                req_args["json"] = data
+            else:
+                req_args["data"] = data
+        async with session.request(method, url, **req_args) as resp:
+            body = await resp.read()
+            return web.Response(
+                status=resp.status,
+                headers={k: v for k, v in resp.headers.items() if k.lower() != "transfer-encoding"},
+                body=body,
+            )
 
-def _handle_response(resp):
-    try:
-        content = resp.json()
-    except Exception:
-        content = resp.text
-    return JSONResponse(status_code=resp.status_code, content=content)
+# Login
+async def login(request):
+    return await proxy_request(request, "/session/login", method="POST")
 
-@app.post("/session/login")
-async def session_login(request: Request):
-    data = await request.json()
-    url = f"{BASE_URL}/session/login"
-    try:
-        resp = requests.post(url, json=data, timeout=10)
-        return _handle_response(resp)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+# Logout
+async def logout(request):
+    return await proxy_request(request, "/session/logout", method="POST")
 
-@app.post("/session/logout")
-async def session_logout(authorization: str = Header(None)):
-    url = f"{BASE_URL}/session/logout"
-    headers = _api_headers(token=authorization.replace("Bearer ", "") if authorization else None)
-    try:
-        resp = requests.post(url, headers=headers, timeout=10)
-        return _handle_response(resp)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+# Schedules (GET/POST)
+async def get_schedules(request):
+    return await proxy_request(request, "/schedules", method="GET")
 
-@app.get("/schedules")
-async def get_schedules(authorization: str = Header(None)):
-    url = f"{BASE_URL}/schedules"
-    headers = _api_headers(token=authorization.replace("Bearer ", "") if authorization else None)
-    try:
-        resp = requests.get(url, headers=headers, timeout=10)
-        return _handle_response(resp)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+async def post_schedules(request):
+    return await proxy_request(request, "/schedules", method="POST")
 
-@app.post("/schedules")
-async def create_schedule(request: Request, authorization: str = Header(None)):
-    data = await request.json()
-    url = f"{BASE_URL}/schedules"
-    headers = _api_headers(token=authorization.replace("Bearer ", "") if authorization else None)
-    try:
-        resp = requests.post(url, headers=headers, json=data, timeout=10)
-        return _handle_response(resp)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+# Posts (GET/POST)
+async def get_posts(request):
+    return await proxy_request(request, "/posts", method="GET")
 
-@app.get("/posts")
-async def get_posts(request: Request, authorization: str = Header(None)):
-    query_string = request.url.query
-    url = f"{BASE_URL}/posts"
-    if query_string:
-        url += f"?{query_string}"
-    headers = _api_headers(token=authorization.replace("Bearer ", "") if authorization else None)
-    try:
-        resp = requests.get(url, headers=headers, timeout=10)
-        return _handle_response(resp)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+async def post_posts(request):
+    return await proxy_request(request, "/posts", method="POST")
 
-@app.post("/posts")
-async def create_post(request: Request, authorization: str = Header(None)):
-    data = await request.json()
-    url = f"{BASE_URL}/posts"
-    headers = _api_headers(token=authorization.replace("Bearer ", "") if authorization else None)
-    try:
-        resp = requests.post(url, headers=headers, json=data, timeout=10)
-        return _handle_response(resp)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+# Search
+async def get_search(request):
+    return await proxy_request(request, "/search", method="GET")
 
-@app.get("/search")
-async def search(request: Request, authorization: str = Header(None)):
-    query_string = request.url.query
-    url = f"{BASE_URL}/search"
-    if query_string:
-        url += f"?{query_string}"
-    headers = _api_headers(token=authorization.replace("Bearer ", "") if authorization else None)
-    try:
-        resp = requests.get(url, headers=headers, timeout=10)
-        return _handle_response(resp)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+# Chats (GET/POST)
+async def get_chat_messages(request):
+    chat_id = request.match_info['chatId']
+    return await proxy_request(request, f"/chats/{chat_id}/messages", method="GET", extra_path_params={"chatId": chat_id})
 
-@app.get("/chats/{chat_id}/messages")
-async def get_chat_messages(chat_id: str, authorization: str = Header(None)):
-    url = f"{BASE_URL}/chats/{chat_id}/messages"
-    headers = _api_headers(token=authorization.replace("Bearer ", "") if authorization else None)
-    try:
-        resp = requests.get(url, headers=headers, timeout=10)
-        return _handle_response(resp)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+async def post_chat_messages(request):
+    chat_id = request.match_info['chatId']
+    return await proxy_request(request, f"/chats/{chat_id}/messages", method="POST", extra_path_params={"chatId": chat_id})
 
-@app.post("/chats/{chat_id}/messages")
-async def post_chat_message(chat_id: str, request: Request, authorization: str = Header(None)):
-    data = await request.json()
-    url = f"{BASE_URL}/chats/{chat_id}/messages"
-    headers = _api_headers(token=authorization.replace("Bearer ", "") if authorization else None)
-    try:
-        resp = requests.post(url, headers=headers, json=data, timeout=10)
-        return _handle_response(resp)
-    except Exception as e:
-        raise HTTPException(status_code=502, detail=str(e))
+# --- WebSocket Proxy Handler ---
+async def ws_handler(request):
+    ws_server = web.WebSocketResponse()
+    await ws_server.prepare(request)
+
+    ws_url = f"{DEVICE_PROTOCOL.replace('http', 'ws')}://{DEVICE_HOST}:{DEVICE_PORT}/ws"
+    async with ClientSession() as session:
+        async with session.ws_connect(ws_url) as ws_client:
+            async def ws_to_client():
+                async for msg in ws_client:
+                    if msg.type == WSMsgType.TEXT:
+                        await ws_server.send_str(msg.data)
+                    elif msg.type == WSMsgType.BINARY:
+                        await ws_server.send_bytes(msg.data)
+                    elif msg.type == WSMsgType.CLOSE:
+                        await ws_server.close()
+                        break
+
+            async def client_to_ws():
+                async for msg in ws_server:
+                    if msg.type == WSMsgType.TEXT:
+                        await ws_client.send_str(msg.data)
+                    elif msg.type == WSMsgType.BINARY:
+                        await ws_client.send_bytes(msg.data)
+                    elif msg.type == WSMsgType.CLOSE:
+                        await ws_client.close()
+                        break
+
+            await asyncio.gather(ws_to_client(), client_to_ws())
+
+    return ws_server
+
+# --- App Routing and Startup ---
+
+app = web.Application()
+app.router.add_post('/session/login', login)
+app.router.add_post('/session/logout', logout)
+app.router.add_get('/schedules', get_schedules)
+app.router.add_post('/schedules', post_schedules)
+app.router.add_get('/posts', get_posts)
+app.router.add_post('/posts', post_posts)
+app.router.add_get('/search', get_search)
+app.router.add_get('/chats/{chatId}/messages', get_chat_messages)
+app.router.add_post('/chats/{chatId}/messages', post_chat_messages)
+app.router.add_get('/ws', ws_handler)  # WebSocket endpoint proxy
 
 if __name__ == "__main__":
-    uvicorn.run(
-        "main:app",
-        host=SERVER_HOST,
-        port=SERVER_PORT,
-        reload=False,
-        ssl_keyfile=os.environ.get("SSL_KEYFILE") if SERVER_USE_HTTPS else None,
-        ssl_certfile=os.environ.get("SSL_CERTFILE") if SERVER_USE_HTTPS else None,
-    )
+    web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
