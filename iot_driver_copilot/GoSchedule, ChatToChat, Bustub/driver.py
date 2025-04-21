@@ -1,115 +1,161 @@
 import os
 import json
 import asyncio
-from typing import Dict, Any, Optional
-from aiohttp import web, ClientSession, WSMsgType
+from urllib.parse import urlencode
 
-DEVICE_HOST = os.environ.get('DEVICE_HOST', '127.0.0.1')
-DEVICE_PORT = int(os.environ.get('DEVICE_PORT', '8080'))
-DEVICE_PROTOCOL = os.environ.get('DEVICE_PROTOCOL', 'http')
-SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.environ.get('SERVER_PORT', '8000'))
+from aiohttp import web, ClientSession, WSMsgType, ClientWebSocketResponse
 
-DEVICE_BASE_URL = f"{DEVICE_PROTOCOL}://{DEVICE_HOST}:{DEVICE_PORT}"
+# Environment variables
+DEVICE_API_HOST = os.environ.get("DEVICE_API_HOST", "127.0.0.1")
+DEVICE_API_PORT = os.environ.get("DEVICE_API_PORT", "8080")
+DEVICE_API_PROTO = os.environ.get("DEVICE_API_PROTO", "http")
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8000"))
 
-def device_url(path: str) -> str:
-    return DEVICE_BASE_URL + path
+DEVICE_BASE_URL = f"{DEVICE_API_PROTO}://{DEVICE_API_HOST}:{DEVICE_API_PORT}"
 
-async def proxy_request(request: web.Request, path: str, method: str, with_body: bool = False, json_subst: Optional[Dict[str, Any]] = None):
-    headers = dict(request.headers)
-    headers.pop('Host', None)
-    url = device_url(path)
-    params = request.query.copy()
-    data = None
-    if with_body:
-        try:
-            data = await request.json()
-        except Exception:
-            data = await request.text()
-    if json_subst:
-        if isinstance(data, dict):
-            data.update(json_subst)
-        else:
-            data = json_subst
+routes = web.RouteTableDef()
+
+# ========== RESTful API Proxy ==========
+
+async def get_auth_header(request):
+    auth = request.headers.get("Authorization")
+    if auth:
+        return {"Authorization": auth}
+    return {}
+
+@routes.post("/session/login")
+async def session_login(request):
+    data = await request.json()
     async with ClientSession() as session:
-        async with session.request(
-            method, url, params=params, headers=headers, json=data if isinstance(data, dict) else None, data=data if isinstance(data, str) else None
-        ) as resp:
-            body = await resp.read()
-            return web.Response(status=resp.status, headers=resp.headers, body=body)
+        async with session.post(f"{DEVICE_BASE_URL}/session/login", json=data) as resp:
+            result = await resp.read()
+            return web.Response(body=result, status=resp.status, content_type=resp.headers.get("Content-Type"))
 
-# API handlers
+@routes.post("/session/logout")
+async def session_logout(request):
+    headers = await get_auth_header(request)
+    async with ClientSession() as session:
+        async with session.post(f"{DEVICE_BASE_URL}/session/logout", headers=headers) as resp:
+            result = await resp.read()
+            return web.Response(body=result, status=resp.status, content_type=resp.headers.get("Content-Type"))
 
-async def login(request):
-    return await proxy_request(request, '/session/login', 'POST', with_body=True)
-
-async def logout(request):
-    return await proxy_request(request, '/session/logout', 'POST', with_body=True)
-
+@routes.get("/schedules")
 async def get_schedules(request):
-    return await proxy_request(request, '/schedules', 'GET')
+    headers = await get_auth_header(request)
+    async with ClientSession() as session:
+        async with session.get(f"{DEVICE_BASE_URL}/schedules", headers=headers) as resp:
+            result = await resp.read()
+            return web.Response(body=result, status=resp.status, content_type=resp.headers.get("Content-Type"))
 
-async def create_schedule(request):
-    return await proxy_request(request, '/schedules', 'POST', with_body=True)
+@routes.post("/schedules")
+async def post_schedules(request):
+    headers = await get_auth_header(request)
+    data = await request.json()
+    async with ClientSession() as session:
+        async with session.post(f"{DEVICE_BASE_URL}/schedules", headers=headers, json=data) as resp:
+            result = await resp.read()
+            return web.Response(body=result, status=resp.status, content_type=resp.headers.get("Content-Type"))
 
+@routes.get("/posts")
 async def get_posts(request):
-    return await proxy_request(request, '/posts', 'GET')
+    headers = await get_auth_header(request)
+    params = request.rel_url.query
+    url = f"{DEVICE_BASE_URL}/posts"
+    if params:
+        url += "?" + urlencode(params)
+    async with ClientSession() as session:
+        async with session.get(url, headers=headers) as resp:
+            result = await resp.read()
+            return web.Response(body=result, status=resp.status, content_type=resp.headers.get("Content-Type"))
 
-async def create_post(request):
-    return await proxy_request(request, '/posts', 'POST', with_body=True)
+@routes.post("/posts")
+async def post_posts(request):
+    headers = await get_auth_header(request)
+    data = await request.json()
+    async with ClientSession() as session:
+        async with session.post(f"{DEVICE_BASE_URL}/posts", headers=headers, json=data) as resp:
+            result = await resp.read()
+            return web.Response(body=result, status=resp.status, content_type=resp.headers.get("Content-Type"))
 
+@routes.get("/search")
 async def search(request):
-    return await proxy_request(request, '/search', 'GET')
+    headers = await get_auth_header(request)
+    params = request.rel_url.query
+    url = f"{DEVICE_BASE_URL}/search"
+    if params:
+        url += "?" + urlencode(params)
+    async with ClientSession() as session:
+        async with session.get(url, headers=headers) as resp:
+            result = await resp.read()
+            return web.Response(body=result, status=resp.status, content_type=resp.headers.get("Content-Type"))
 
+@routes.get("/chats/{chatId}/messages")
 async def get_chat_messages(request):
-    chat_id = request.match_info['chatId']
-    return await proxy_request(request, f'/chats/{chat_id}/messages', 'GET')
+    headers = await get_auth_header(request)
+    chat_id = request.match_info["chatId"]
+    url = f"{DEVICE_BASE_URL}/chats/{chat_id}/messages"
+    async with ClientSession() as session:
+        async with session.get(url, headers=headers) as resp:
+            result = await resp.read()
+            return web.Response(body=result, status=resp.status, content_type=resp.headers.get("Content-Type"))
 
-async def post_chat_message(request):
-    chat_id = request.match_info['chatId']
-    return await proxy_request(request, f'/chats/{chat_id}/messages', 'POST', with_body=True)
+@routes.post("/chats/{chatId}/messages")
+async def post_chat_messages(request):
+    headers = await get_auth_header(request)
+    chat_id = request.match_info["chatId"]
+    data = await request.json()
+    url = f"{DEVICE_BASE_URL}/chats/{chat_id}/messages"
+    async with ClientSession() as session:
+        async with session.post(url, headers=headers, json=data) as resp:
+            result = await resp.read()
+            return web.Response(body=result, status=resp.status, content_type=resp.headers.get("Content-Type"))
 
-# WebSocket proxying (if needed)
-async def websocket_handler(request):
+# ========== WebSocket Proxy ==========
+
+@routes.get("/wsproxy/{tail:.*}")
+async def websocket_proxy(request):
+    # ws://localhost:8000/wsproxy/ws/chat/123
     ws_server = web.WebSocketResponse()
     await ws_server.prepare(request)
-    ws_url = f"ws{'s' if DEVICE_PROTOCOL == 'https' else ''}://{DEVICE_HOST}:{DEVICE_PORT}/ws"
+
+    tail = request.match_info["tail"]
+    params = request.rel_url.query
+    remote_path = f"/{tail}"
+    if params:
+        remote_url = f"{DEVICE_API_PROTO}://{DEVICE_API_HOST}:{DEVICE_API_PORT}{remote_path}?{urlencode(params)}"
+    else:
+        remote_url = f"{DEVICE_API_PROTO}://{DEVICE_API_HOST}:{DEVICE_API_PORT}{remote_path}"
+
+    headers = await get_auth_header(request)
     async with ClientSession() as session:
-        async with session.ws_connect(ws_url) as ws_client:
-            async def client_to_server():
-                async for msg in ws_server:
-                    if msg.type == WSMsgType.TEXT:
-                        await ws_client.send_str(msg.data)
-                    elif msg.type == WSMsgType.BINARY:
-                        await ws_client.send_bytes(msg.data)
-                    elif msg.type == WSMsgType.CLOSE:
-                        await ws_client.close()
-            async def server_to_client():
-                async for msg in ws_client:
-                    if msg.type == WSMsgType.TEXT:
-                        await ws_server.send_str(msg.data)
-                    elif msg.type == WSMsgType.BINARY:
-                        await ws_server.send_bytes(msg.data)
-                    elif msg.type == WSMsgType.CLOSE:
-                        await ws_server.close()
-            await asyncio.gather(client_to_server(), server_to_client())
-    return ws_server
+        try:
+            ws_client: ClientWebSocketResponse = await session.ws_connect(remote_url, headers=headers)
+        except Exception as e:
+            await ws_server.send_str(json.dumps({"error": str(e)}))
+            await ws_server.close()
+            return ws_server
 
-# Main app setup
+        async def ws_forward(ws_from, ws_to):
+            async for msg in ws_from:
+                if msg.type == WSMsgType.TEXT:
+                    await ws_to.send_str(msg.data)
+                elif msg.type == WSMsgType.BINARY:
+                    await ws_to.send_bytes(msg.data)
+                elif msg.type == WSMsgType.CLOSE:
+                    await ws_to.close()
+                    break
+
+        await asyncio.gather(
+            ws_forward(ws_server, ws_client),
+            ws_forward(ws_client, ws_server),
+        )
+        return ws_server
+
+# ========== App Setup ==========
+
 app = web.Application()
+app.add_routes(routes)
 
-app.add_routes([
-    web.post('/session/login', login),
-    web.post('/session/logout', logout),
-    web.get('/schedules', get_schedules),
-    web.post('/schedules', create_schedule),
-    web.get('/posts', get_posts),
-    web.post('/posts', create_post),
-    web.get('/search', search),
-    web.get('/chats/{chatId}/messages', get_chat_messages),
-    web.post('/chats/{chatId}/messages', post_chat_message),
-    web.get('/ws', websocket_handler),
-])
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
