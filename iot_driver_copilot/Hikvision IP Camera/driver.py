@@ -1,75 +1,90 @@
 import os
-import io
 import threading
-import cv2
+import io
+import av
+import queue
 from flask import Flask, Response, stream_with_context
 
-# Read configuration from environment variables
-DEVICE_IP = os.environ.get("DEVICE_IP", "192.168.1.64")
-RTSP_PORT = os.environ.get("RTSP_PORT", "554")
-RTSP_USERNAME = os.environ.get("RTSP_USERNAME", "admin")
-RTSP_PASSWORD = os.environ.get("RTSP_PASSWORD", "12345")
-RTSP_PATH = os.environ.get("RTSP_PATH", "Streaming/Channels/101")
+# Get configuration from environment variables
+DEVICE_IP = os.environ.get("DEVICE_IP")
+RTSP_PORT = int(os.environ.get("RTSP_PORT", "554"))
+RTSP_USER = os.environ.get("RTSP_USER", "")
+RTSP_PASS = os.environ.get("RTSP_PASS", "")
 SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
 SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
+RTSP_PATH = os.environ.get("RTSP_PATH", "Streaming/Channels/101")
 
-RTSP_URL = f"rtsp://{RTSP_USERNAME}:{RTSP_PASSWORD}@{DEVICE_IP}:{RTSP_PORT}/{RTSP_PATH}"
+# RTSP URL construction
+if RTSP_USER and RTSP_PASS:
+    RTSP_URL = f"rtsp://{RTSP_USER}:{RTSP_PASS}@{DEVICE_IP}:{RTSP_PORT}/{RTSP_PATH}"
+else:
+    RTSP_URL = f"rtsp://{DEVICE_IP}:{RTSP_PORT}/{RTSP_PATH}"
 
 app = Flask(__name__)
 
-class CameraStream:
+class RTSPtoMJPEGStreamer:
     def __init__(self, rtsp_url):
         self.rtsp_url = rtsp_url
-        self.cap = None
-        self.lock = threading.Lock()
+        self.clients = []
+        self.frame_queue = queue.Queue(maxsize=50)
         self.running = False
-        self.frame = None
-        self.thread = None
+        self.thread = threading.Thread(target=self._worker, daemon=True)
 
     def start(self):
-        with self.lock:
-            if not self.running:
-                self.running = True
-                self.cap = cv2.VideoCapture(self.rtsp_url)
-                self.thread = threading.Thread(target=self.update, daemon=True)
-                self.thread.start()
+        if not self.running:
+            self.running = True
+            self.thread.start()
 
     def stop(self):
-        with self.lock:
-            self.running = False
-            if self.cap:
-                self.cap.release()
-                self.cap = None
+        self.running = False
 
-    def update(self):
-        while self.running:
-            if self.cap:
-                ret, frame = self.cap.read()
-                if ret:
-                    self.frame = frame
+    def _worker(self):
+        try:
+            container = av.open(self.rtsp_url)
+            stream = next(s for s in container.streams if s.type == "video")
+            for packet in container.demux(stream):
+                if not self.running:
+                    break
+                for frame in packet.decode():
+                    img = frame.to_image()
+                    with io.BytesIO() as output:
+                        img.save(output, format="JPEG")
+                        jpeg_bytes = output.getvalue()
+                        try:
+                            self.frame_queue.put(jpeg_bytes, timeout=1)
+                        except queue.Full:
+                            # Drop frames if queue is full
+                            pass
+        except Exception:
+            pass
 
     def get_frame(self):
-        if self.frame is not None:
-            ret, jpeg = cv2.imencode('.jpg', self.frame)
-            if ret:
-                return jpeg.tobytes()
-        return None
+        try:
+            return self.frame_queue.get(timeout=5)
+        except queue.Empty:
+            return None
 
-camera = CameraStream(RTSP_URL)
+streamer = RTSPtoMJPEGStreamer(RTSP_URL)
+streamer.start()
 
-@app.route('/stream', methods=['GET'])
-def stream():
-    camera.start()
-    def generate():
-        while True:
-            frame = camera.get_frame()
-            if frame is not None:
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-            else:
-                # If no frame, try to wait a bit
-                cv2.waitKey(10)
-    return Response(stream_with_context(generate()), mimetype='multipart/x-mixed-replace; boundary=frame')
+def mjpeg_stream():
+    while True:
+        frame = streamer.get_frame()
+        if frame is None:
+            continue
+        yield (
+            b"--frame\r\n"
+            b"Content-Type: image/jpeg\r\n"
+            b"Content-Length: " + str(len(frame)).encode() + b"\r\n\r\n" +
+            frame + b"\r\n"
+        )
 
-if __name__ == '__main__':
+@app.route("/stream", methods=["GET"])
+def stream_video():
+    return Response(
+        stream_with_context(mjpeg_stream()),
+        mimetype="multipart/x-mixed-replace; boundary=frame"
+    )
+
+if __name__ == "__main__":
     app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
