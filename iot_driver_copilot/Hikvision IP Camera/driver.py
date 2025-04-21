@@ -1,100 +1,133 @@
 import os
-import io
 import threading
-import time
-import requests
-from flask import Flask, Response, jsonify, stream_with_context
+import queue
+import cv2
+from flask import Flask, Response, request, jsonify, abort
+from dotenv import load_dotenv
 
-# Configuration via environment variables
-DEVICE_IP = os.environ.get('DEVICE_IP', '192.168.1.64')
-DEVICE_USER = os.environ.get('DEVICE_USER', 'admin')
-DEVICE_PASSWORD = os.environ.get('DEVICE_PASSWORD', '12345')
-SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
-RTSP_PORT = int(os.environ.get('RTSP_PORT', '554'))
-HTTP_PORT = int(os.environ.get('HTTP_PORT', '80'))
-SNAPSHOT_PATH = os.environ.get('SNAPSHOT_PATH', '/ISAPI/Streaming/channels/101/picture')
-MJPEG_PATH = os.environ.get('MJPEG_PATH', '/ISAPI/Streaming/channels/101/httpPreview')
-RTSP_CHANNEL = os.environ.get('RTSP_CHANNEL', '101')
+load_dotenv()
 
-# Flask App
+# Configuration from environment variables
+CAMERA_IP = os.getenv('CAMERA_IP')
+CAMERA_RTSP_PORT = os.getenv('CAMERA_RTSP_PORT', '554')
+CAMERA_USER = os.getenv('CAMERA_USER', 'admin')
+CAMERA_PASSWORD = os.getenv('CAMERA_PASSWORD', '12345')
+CAMERA_CHANNEL = os.getenv('CAMERA_CHANNEL', '1')
+RTSP_STREAM_PATH = os.getenv('RTSP_STREAM_PATH', f'/Streaming/Channels/{CAMERA_CHANNEL}01')
+RTSP_TRANSPORT = os.getenv('RTSP_TRANSPORT', 'tcp')
+HTTP_SERVER_HOST = os.getenv('HTTP_SERVER_HOST', '0.0.0.0')
+HTTP_SERVER_PORT = int(os.getenv('HTTP_SERVER_PORT', 8000))
+
 app = Flask(__name__)
 
-def get_rtsp_url():
-    return f'rtsp://{DEVICE_USER}:{DEVICE_PASSWORD}@{DEVICE_IP}:{RTSP_PORT}/Streaming/Channels/{RTSP_CHANNEL}'
+class RTSPStreamProxy:
+    def __init__(self):
+        self.rtsp_url = f'rtsp://{CAMERA_USER}:{CAMERA_PASSWORD}@{CAMERA_IP}:{CAMERA_RTSP_PORT}{RTSP_STREAM_PATH}'
+        self.transport = RTSP_TRANSPORT
+        self._capture = None
+        self._frame_queue = queue.Queue(maxsize=10)
+        self._running = False
+        self._thread = None
+        self._lock = threading.Lock()
 
-def get_snapshot_url():
-    return f'http://{DEVICE_IP}:{HTTP_PORT}{SNAPSHOT_PATH}'
+    def start(self):
+        with self._lock:
+            if self._running:
+                return True
+            self._running = True
+            self._thread = threading.Thread(target=self._reader, daemon=True)
+            self._thread.start()
+        return True
 
-def get_mjpeg_url():
-    return f'http://{DEVICE_IP}:{HTTP_PORT}{MJPEG_PATH}'
+    def stop(self):
+        with self._lock:
+            self._running = False
+            if self._capture:
+                self._capture.release()
+                self._capture = None
+            while not self._frame_queue.empty():
+                try:
+                    self._frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+        return True
 
-def gen_mjpeg_stream():
-    url = get_mjpeg_url()
-    auth = (DEVICE_USER, DEVICE_PASSWORD)
-    headers = {'Accept': 'multipart/x-mixed-replace'}
-    try:
-        with requests.get(url, stream=True, auth=auth, timeout=10, headers=headers) as r:
-            r.raise_for_status()
-            boundary = None
-            ctype = r.headers.get('Content-Type', '')
-            if 'boundary=' in ctype:
-                boundary = ctype.split('boundary=')[1].strip().strip('"')
-            else:
-                boundary = '--myboundary'
-            boundary = boundary if boundary.startswith('--') else '--' + boundary
-            buffer = b''
-            for chunk in r.iter_content(chunk_size=4096):
-                if not chunk:
-                    break
-                buffer += chunk
-                while True:
-                    start = buffer.find(b'\xff\xd8')
-                    end = buffer.find(b'\xff\xd9')
-                    if start != -1 and end != -1 and end > start:
-                        jpg = buffer[start:end+2]
-                        buffer = buffer[end+2:]
-                        part = (
-                            b'--frame\r\n'
-                            b'Content-Type: image/jpeg\r\n\r\n' +
-                            jpg + b'\r\n'
-                        )
-                        yield part
-                    else:
-                        # Not enough data for a full JPEG
-                        break
-    except Exception as e:
-        # End stream on error
-        return
+    def _reader(self):
+        cap = cv2.VideoCapture(self.rtsp_url, cv2.CAP_FFMPEG)
+        self._capture = cap
+        while self._running and cap.isOpened():
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            # Keep only latest frame
+            if self._frame_queue.full():
+                try:
+                    self._frame_queue.get_nowait()
+                except queue.Empty:
+                    pass
+            self._frame_queue.put(frame)
+        cap.release()
+        self._capture = None
 
-@app.route('/camera/live', methods=['GET'])
-def camera_live():
-    return Response(
-        stream_with_context(gen_mjpeg_stream()),
-        mimetype='multipart/x-mixed-replace; boundary=frame'
-    )
+    def get_frame(self):
+        try:
+            frame = self._frame_queue.get(timeout=2)
+            return frame
+        except queue.Empty:
+            return None
 
-@app.route('/camera/rtsp-url', methods=['GET'])
-def camera_rtsp_url():
-    return jsonify({
-        'rtsp_url': get_rtsp_url()
-    })
+stream_proxy = RTSPStreamProxy()
 
-@app.route('/camera/snapshot', methods=['GET'])
-def camera_snapshot():
-    url = get_snapshot_url()
-    try:
-        r = requests.get(url, auth=(DEVICE_USER, DEVICE_PASSWORD), stream=True, timeout=10)
-        r.raise_for_status()
-        return Response(
-            r.content,
-            mimetype='image/jpeg',
-            headers={
-                'Content-Disposition': 'inline; filename=snapshot.jpg'
-            }
-        )
-    except Exception as e:
-        return jsonify({'error': 'Failed to get snapshot', 'details': str(e)}), 500
+@app.route('/stream', methods=['PUT'])
+def start_stream():
+    ok = stream_proxy.start()
+    if ok:
+        return jsonify({"status": "started"}), 200
+    else:
+        abort(500, "Failed to start stream")
+
+@app.route('/stream', methods=['DELETE'])
+def stop_stream():
+    ok = stream_proxy.stop()
+    if ok:
+        return jsonify({"status": "stopped"}), 200
+    else:
+        abort(500, "Failed to stop stream")
+
+def mjpeg_generator():
+    while stream_proxy._running:
+        frame = stream_proxy.get_frame()
+        if frame is None:
+            continue
+        ret, jpeg = cv2.imencode('.jpg', frame)
+        if not ret:
+            continue
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
+
+@app.route('/stream', methods=['GET'])
+def stream_video():
+    if not stream_proxy._running:
+        abort(404, "Stream is not started. Use PUT /stream to start.")
+    return Response(mjpeg_generator(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
+
+@app.route('/snapshot', methods=['GET'])
+def get_snapshot():
+    if not stream_proxy._running:
+        # Temporarily start, grab one frame, stop
+        stream_proxy.start()
+        threading.Event().wait(1.5)  # Give time to fill frame queue
+        frame = stream_proxy.get_frame()
+        stream_proxy.stop()
+    else:
+        frame = stream_proxy.get_frame()
+    if frame is None:
+        abort(500, "Unable to capture snapshot")
+    ret, jpeg = cv2.imencode('.jpg', frame)
+    if not ret:
+        abort(500, "JPEG encoding failed")
+    return Response(jpeg.tobytes(), mimetype='image/jpeg')
 
 if __name__ == '__main__':
-    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
+    app.run(host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT, threaded=True)
