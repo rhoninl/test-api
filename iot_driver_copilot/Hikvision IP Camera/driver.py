@@ -1,139 +1,185 @@
 import os
-import uuid
 import threading
+import uuid
 import time
-from flask import Flask, request, Response, jsonify, abort
+from flask import Flask, Response, request, jsonify, abort
 import cv2
 
-# Configuration from environment variables
-CAMERA_IP = os.environ.get('CAMERA_IP')
-CAMERA_PORT = os.environ.get('CAMERA_RTSP_PORT', '554')
-CAMERA_USER = os.environ.get('CAMERA_USER')
-CAMERA_PASS = os.environ.get('CAMERA_PASS')
-CAMERA_STREAM = os.environ.get('CAMERA_STREAM', 'Streaming/Channels/101')
-RTSP_TRANSPORT = os.environ.get('RTSP_TRANSPORT', 'tcp')  # 'tcp' or 'udp'
-SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
+# Environment variables for configuration
+CAMERA_IP = os.environ.get("CAMERA_IP")
+CAMERA_RTSP_PORT = int(os.environ.get("CAMERA_RTSP_PORT", "554"))
+CAMERA_USERNAME = os.environ.get("CAMERA_USERNAME", "admin")
+CAMERA_PASSWORD = os.environ.get("CAMERA_PASSWORD", "12345")
+CAMERA_STREAM_PATH = os.environ.get("CAMERA_STREAM_PATH", "Streaming/Channels/101")
+CAMERA_STREAM_TYPE = os.environ.get("CAMERA_STREAM_TYPE", "h264")  # h264 or mjpeg
 
-app = Flask(__name__)
+HTTP_HOST = os.environ.get("HTTP_HOST", "0.0.0.0")
+HTTP_PORT = int(os.environ.get("HTTP_PORT", "8080"))
 
-# Session management for streams
+# Session management
 sessions = {}
 sessions_lock = threading.Lock()
 
+
 def build_rtsp_url():
-    if CAMERA_USER and CAMERA_PASS:
-        return f"rtsp://{CAMERA_USER}:{CAMERA_PASS}@{CAMERA_IP}:{CAMERA_PORT}/{CAMERA_STREAM}"
-    else:
-        return f"rtsp://{CAMERA_IP}:{CAMERA_PORT}/{CAMERA_STREAM}"
+    return f"rtsp://{CAMERA_USERNAME}:{CAMERA_PASSWORD}@{CAMERA_IP}:{CAMERA_RTSP_PORT}/{CAMERA_STREAM_PATH}"
 
-class CameraStream:
-    def __init__(self, rtsp_url, transport='tcp'):
+
+class CameraSession:
+    def __init__(self, session_id, rtsp_url):
+        self.session_id = session_id
         self.rtsp_url = rtsp_url
-        self.transport = transport
-        self.capture = None
-        self.running = False
+        self.active = True
+        self.last_access = time.time()
         self.lock = threading.Lock()
-        self.last_frame = None
-        self.thread = None
+        self.cap = None
 
-    def start(self):
+    def open(self):
+        self.cap = cv2.VideoCapture(self.rtsp_url)
+
+    def close(self):
+        self.active = False
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+        self.cap = None
+
+    def keepalive(self):
         with self.lock:
-            if self.running:
-                return
-            self.running = True
-            self.capture = cv2.VideoCapture(self._build_opencv_url(), cv2.CAP_FFMPEG)
-            self.thread = threading.Thread(target=self._update, daemon=True)
-            self.thread.start()
+            self.last_access = time.time()
 
-    def _build_opencv_url(self):
-        # OpenCV does not support explicit transport selection, but some builds support ?rtsp_transport=xxx
-        # We'll try to use it if provided
-        return f"{self.rtsp_url}?rtsp_transport={self.transport}"
-
-    def _update(self):
-        while self.running and self.capture and self.capture.isOpened():
-            ret, frame = self.capture.read()
+    def read_frame(self):
+        if self.cap is None or not self.cap.isOpened():
+            self.open()
+        ret, frame = self.cap.read()
+        if not ret or frame is None:
+            return None
+        if CAMERA_STREAM_TYPE.lower() == "mjpeg":
+            ret, buffer = cv2.imencode('.jpg', frame)
             if not ret:
-                time.sleep(0.1)
-                continue
-            with self.lock:
-                self.last_frame = frame
-        if self.capture:
-            self.capture.release()
+                return None
+            return buffer.tobytes()
+        else:  # h264, we will encode as JPEG for browser compatibility
+            ret, buffer = cv2.imencode('.jpg', frame)
+            if not ret:
+                return None
+            return buffer.tobytes()
 
-    def read_mjpeg(self):
-        while self.running:
-            with self.lock:
-                frame = self.last_frame
-            if frame is not None:
-                ret, jpeg = cv2.imencode('.jpg', frame)
-                if ret:
-                    yield (b'--frame\r\n'
-                           b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
-            time.sleep(0.04)  # ~25FPS
 
-    def stop(self):
-        with self.lock:
-            self.running = False
-        if self.thread:
-            self.thread.join(timeout=2)
-        if self.capture:
-            self.capture.release()
+def create_session():
+    session_id = str(uuid.uuid4())
+    rtsp_url = build_rtsp_url()
+    session = CameraSession(session_id, rtsp_url)
+    with sessions_lock:
+        sessions[session_id] = session
+    return session
+
+
+def get_session(session_id):
+    with sessions_lock:
+        session = sessions.get(session_id)
+    return session
+
+
+def remove_session(session_id):
+    with sessions_lock:
+        session = sessions.pop(session_id, None)
+    if session:
+        session.close()
+
+
+def cleanup_sessions(timeout=60):
+    while True:
+        now = time.time()
+        with sessions_lock:
+            expired = [sid for sid, sess in sessions.items() if now - sess.last_access > timeout]
+        for sid in expired:
+            remove_session(sid)
+        time.sleep(10)
+
+
+# Background thread for session cleanup
+cleanup_thread = threading.Thread(target=cleanup_sessions, args=(120,), daemon=True)
+cleanup_thread.start()
+
+app = Flask(__name__)
+
 
 @app.route('/camera/stream/init', methods=['POST'])
 def init_stream():
-    session_id = str(uuid.uuid4())
-    rtsp_url = build_rtsp_url()
-    cam_stream = CameraStream(rtsp_url, RTSP_TRANSPORT)
-    cam_stream.start()
-    with sessions_lock:
-        sessions[session_id] = cam_stream
-    http_url = f"http://{SERVER_HOST}:{SERVER_PORT}/camera/stream/live?session_id={session_id}"
+    session = create_session()
+    # Start the OpenCV VideoCapture as a test; if failed, abort
+    try:
+        session.open()
+        if not session.cap or not session.cap.isOpened():
+            remove_session(session.session_id)
+            return jsonify({"error": "Unable to connect to camera."}), 500
+    except Exception as e:
+        remove_session(session.session_id)
+        return jsonify({"error": str(e)}), 500
+    # Compose HTTP URL for the stream
+    http_url = f"http://{request.host}/camera/stream/live?session={session.session_id}"
     return jsonify({
-        'session_id': session_id,
-        'http_url': http_url
+        "session_id": session.session_id,
+        "stream_url": http_url
     })
 
+
+def gen_mjpeg_stream(session):
+    boundary = "--frame"
+    while session.active:
+        frame = session.read_frame()
+        if frame is None:
+            time.sleep(0.05)
+            continue
+        session.keepalive()
+        yield (
+            b'--frame\r\n'
+            b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n'
+        )
+
+
 @app.route('/camera/stream/live', methods=['GET'])
-def stream_live():
-    session_id = request.args.get('session_id')
+def live_stream():
+    session_id = request.args.get('session')
     if not session_id:
-        abort(400, description="Missing session_id")
-    with sessions_lock:
-        cam_stream = sessions.get(session_id)
-    if not cam_stream:
-        abort(404, description="Session not found")
-    return Response(cam_stream.read_mjpeg(),
+        return jsonify({"error": "Session id is required"}), 400
+    session = get_session(session_id)
+    if not session or not session.active:
+        return jsonify({"error": "Invalid or inactive session"}), 404
+    session.keepalive()
+    return Response(gen_mjpeg_stream(session),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
+
 
 @app.route('/camera/stream/terminate', methods=['POST'])
 def terminate_stream():
-    data = request.get_json(silent=True)
-    session_id = None
-    if data and 'session_id' in data:
-        session_id = data['session_id']
-    else:
-        session_id = request.args.get('session_id')
+    data = request.json or request.form or request.args
+    session_id = data.get('session') or data.get('session_id')
     if not session_id:
-        abort(400, description="Missing session_id")
-    with sessions_lock:
-        cam_stream = sessions.pop(session_id, None)
-    if cam_stream:
-        cam_stream.stop()
-        return jsonify({'status': 'terminated', 'session_id': session_id})
-    else:
-        abort(404, description="Session not found")
+        return jsonify({"error": "Session id is required"}), 400
+    session = get_session(session_id)
+    if not session:
+        return jsonify({"error": "Invalid session id"}), 404
+    remove_session(session_id)
+    return jsonify({"result": "Session terminated"})
+
 
 @app.route('/stream/stop', methods=['POST'])
-def stop_all_streams():
-    with sessions_lock:
-        session_ids = list(sessions.keys())
-        for session_id in session_ids:
-            cam_stream = sessions.pop(session_id, None)
-            if cam_stream:
-                cam_stream.stop()
-    return jsonify({'status': 'all streams stopped'})
+def stop_stream():
+    # Accept session id in POST body or query
+    data = request.json or request.form or request.args
+    session_id = data.get('session') or data.get('session_id')
+    if not session_id:
+        return jsonify({"error": "Session id is required"}), 400
+    session = get_session(session_id)
+    if not session:
+        return jsonify({"error": "Invalid session id"}), 404
+    remove_session(session_id)
+    return jsonify({"result": "Stream stopped"})
+
 
 if __name__ == '__main__':
-    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
+    app.run(host=HTTP_HOST, port=HTTP_PORT, threaded=True)
