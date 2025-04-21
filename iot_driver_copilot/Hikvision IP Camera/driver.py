@@ -1,77 +1,76 @@
 import os
 import threading
-import queue
-import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import socketserver
 import cv2
-from flask import Flask, Response, stream_with_context
+import numpy as np
 
-# Environment variables for configuration
-DEVICE_IP = os.environ.get('DEVICE_IP', '192.168.1.64')
-DEVICE_RTSP_PORT = int(os.environ.get('DEVICE_RTSP_PORT', '554'))
-DEVICE_RTSP_USER = os.environ.get('DEVICE_RTSP_USER', 'admin')
-DEVICE_RTSP_PASS = os.environ.get('DEVICE_RTSP_PASS', '12345')
-DEVICE_RTSP_PATH = os.environ.get('DEVICE_RTSP_PATH', '/Streaming/Channels/101')
-SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
+DEVICE_IP = os.environ.get("DEVICE_IP", "192.168.1.64")
+RTSP_PORT = int(os.environ.get("RTSP_PORT", "554"))
+RTSP_USERNAME = os.environ.get("RTSP_USERNAME", "admin")
+RTSP_PASSWORD = os.environ.get("RTSP_PASSWORD", "12345")
+RTSP_PATH = os.environ.get("RTSP_PATH", "Streaming/Channels/101")
+SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", "8080"))
 
-RTSP_URL = f"rtsp://{DEVICE_RTSP_USER}:{DEVICE_RTSP_PASS}@{DEVICE_IP}:{DEVICE_RTSP_PORT}{DEVICE_RTSP_PATH}"
+RTSP_URL = f"rtsp://{RTSP_USERNAME}:{RTSP_PASSWORD}@{DEVICE_IP}:{RTSP_PORT}/{RTSP_PATH}"
 
-# MJPEG streaming settings
-FRAME_QUEUE_SIZE = int(os.environ.get('FRAME_QUEUE_SIZE', '8'))
-FPS = int(os.environ.get('FPS', '10'))
+BOUNDARY = "frameBOUNDARY"
 
-app = Flask(__name__)
-
-frame_queue = queue.Queue(maxsize=FRAME_QUEUE_SIZE)
-stop_event = threading.Event()
-
-def rtsp_to_mjpeg_worker():
-    cap = cv2.VideoCapture(RTSP_URL)
-    if not cap.isOpened():
-        return
-    try:
-        while not stop_event.is_set():
-            ret, frame = cap.read()
-            if not ret:
-                continue
-            ret, jpeg = cv2.imencode('.jpg', frame)
-            if not ret:
-                continue
+class StreamingHandler(BaseHTTPRequestHandler):
+    def do_GET(self):
+        if self.path == '/stream':
+            self.send_response(200)
+            self.send_header('Age', '0')
+            self.send_header('Cache-Control', 'no-cache, private')
+            self.send_header('Pragma', 'no-cache')
+            self.send_header('Content-Type', f'multipart/x-mixed-replace; boundary={BOUNDARY}')
+            self.end_headers()
             try:
-                if frame_queue.full():
-                    frame_queue.get_nowait()
-                frame_queue.put_nowait(jpeg.tobytes())
-            except queue.Full:
+                cap = cv2.VideoCapture(RTSP_URL)
+                if not cap.isOpened():
+                    self.send_error(502, f"Could not connect to RTSP stream at {RTSP_URL}")
+                    return
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        continue
+                    ret, jpg = cv2.imencode('.jpg', frame)
+                    if not ret:
+                        continue
+                    self.wfile.write(bytes(f"--{BOUNDARY}\r\n", 'utf-8'))
+                    self.wfile.write(b"Content-Type: image/jpeg\r\n")
+                    self.wfile.write(bytes(f"Content-Length: {len(jpg.tobytes())}\r\n\r\n", 'utf-8'))
+                    self.wfile.write(jpg.tobytes())
+                    self.wfile.write(b"\r\n")
+            except BrokenPipeError:
                 pass
-            time.sleep(1.0 / FPS)
+            except Exception:
+                pass
+            finally:
+                try:
+                    cap.release()
+                except Exception:
+                    pass
+        else:
+            self.send_response(404)
+            self.end_headers()
+            self.wfile.write(b'Not Found')
+
+    def log_message(self, format, *args):
+        return  # Suppress logging to stdout
+
+class ThreadingHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+def run():
+    server = ThreadingHTTPServer((SERVER_HOST, SERVER_PORT), StreamingHandler)
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
     finally:
-        cap.release()
-
-def mjpeg_stream_generator():
-    while not stop_event.is_set():
-        try:
-            frame = frame_queue.get(timeout=2)
-        except queue.Empty:
-            continue
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-
-@app.route('/stream', methods=['GET'])
-def stream():
-    return Response(
-        stream_with_context(mjpeg_stream_generator()),
-        mimetype='multipart/x-mixed-replace; boundary=frame'
-    )
-
-def start_rtsp_thread():
-    t = threading.Thread(target=rtsp_to_mjpeg_worker, daemon=True)
-    t.start()
-    return t
+        server.server_close()
 
 if __name__ == '__main__':
-    rtsp_thread = start_rtsp_thread()
-    try:
-        app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
-    finally:
-        stop_event.set()
-        rtsp_thread.join(timeout=5)
+    run()
