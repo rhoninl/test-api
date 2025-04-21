@@ -1,117 +1,178 @@
+```python
 import os
+import asyncio
 import uuid
-import threading
-import queue
-from flask import Flask, Response, request, jsonify, abort
+from typing import Dict, Optional
+from fastapi import FastAPI, Request, HTTPException, Response, status
+from fastapi.responses import StreamingResponse, JSONResponse
+from pydantic import BaseModel
+import av
 
-import cv2
-
-# Configuration from environment variables
 DEVICE_IP = os.environ.get("DEVICE_IP")
 DEVICE_RTSP_PORT = int(os.environ.get("DEVICE_RTSP_PORT", "554"))
 DEVICE_RTSP_USER = os.environ.get("DEVICE_RTSP_USER", "admin")
 DEVICE_RTSP_PASS = os.environ.get("DEVICE_RTSP_PASS", "12345")
-CAMERA_CHANNEL = os.environ.get("CAMERA_CHANNEL", "101")
-CAMERA_STREAM_TYPE = os.environ.get("CAMERA_STREAM_TYPE", "h264")  # h264 or mjpeg
+RTSP_PATH = os.environ.get("RTSP_PATH", "Streaming/Channels/101")
 SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
 SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
 
-RTSP_URL_TEMPLATE = "rtsp://{user}:{pwd}@{ip}:{port}/Streaming/Channels/{channel}"
+RTSP_URL_TEMPLATE = "rtsp://{user}:{pwd}@{ip}:{port}/{path}"
 
-app = Flask(__name__)
+app = FastAPI()
 
-# Session store: session_id -> {'cap': cv2.VideoCapture, 'queue': queue.Queue, 'thread': Thread, 'active': bool}
-active_streams = {}
-active_streams_lock = threading.Lock()
+class SessionInfo:
+    def __init__(self, rtsp_url: str, fmt: str):
+        self.rtsp_url = rtsp_url
+        self.format = fmt
+        self.container: Optional[av.container.InputContainer] = None
+        self.active = True
+        self.lock = asyncio.Lock()
 
-def generate_mjpeg_frames(session_id):
-    with active_streams_lock:
-        stream_info = active_streams.get(session_id)
-    if not stream_info or not stream_info['active']:
-        return
-    cap = stream_info["cap"]
-    while stream_info['active']:
-        success, frame = cap.read()
-        if not success:
-            break
-        ret, jpeg = cv2.imencode('.jpg', frame)
-        if not ret:
-            continue
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + jpeg.tobytes() + b'\r\n')
-    cap.release()
+_sessions: Dict[str, SessionInfo] = {}
 
-def start_video_capture(rtsp_url):
-    cap = cv2.VideoCapture(rtsp_url)
-    if not cap.isOpened():
-        return None
-    return cap
+class InitStreamRequest(BaseModel):
+    format: Optional[str] = "mjpeg"  # "mjpeg" or "h264"
 
-def stop_stream(session_id):
-    with active_streams_lock:
-        stream_info = active_streams.pop(session_id, None)
-    if stream_info:
-        stream_info['active'] = False
-        if stream_info['cap'] and stream_info['cap'].isOpened():
-            stream_info['cap'].release()
-        if stream_info.get('thread') and stream_info['thread'].is_alive():
-            stream_info['thread'].join(timeout=1)
+class TerminateRequest(BaseModel):
+    session_id: str
 
-@app.route("/camera/stream/init", methods=["POST"])
-def camera_stream_init():
-    session_id = str(uuid.uuid4())
-    if CAMERA_STREAM_TYPE.lower() == 'h264':
-        # For browser compatibility, we proxy as MJPEG since native H264 is not supported in most browsers
-        stream_format = 'mjpeg'
-    else:
-        stream_format = CAMERA_STREAM_TYPE.lower()
-    rtsp_url = RTSP_URL_TEMPLATE.format(
+def get_rtsp_url(fmt: str):
+    return RTSP_URL_TEMPLATE.format(
         user=DEVICE_RTSP_USER,
         pwd=DEVICE_RTSP_PASS,
         ip=DEVICE_IP,
         port=DEVICE_RTSP_PORT,
-        channel=CAMERA_CHANNEL
+        path=RTSP_PATH
     )
-    cap = start_video_capture(rtsp_url)
-    if not cap:
-        return jsonify({"error": "Unable to connect to camera RTSP stream"}), 500
-    with active_streams_lock:
-        active_streams[session_id] = {'cap': cap, 'active': True, 'thread': None}
-    http_url = f"http://{SERVER_HOST}:{SERVER_PORT}/camera/stream/live?session_id={session_id}"
-    return jsonify({
+
+def get_stream_mime(fmt: str):
+    if fmt.lower() == "mjpeg":
+        return "multipart/x-mixed-replace; boundary=frame"
+    elif fmt.lower() == "h264":
+        return "video/mp4"
+    else:
+        return "application/octet-stream"
+
+@app.post("/camera/stream/init")
+async def camera_stream_init(req: InitStreamRequest):
+    fmt = req.format.lower() if req.format else "mjpeg"
+    if fmt not in ("mjpeg", "h264"):
+        raise HTTPException(status_code=400, detail="Unsupported format")
+    session_id = str(uuid.uuid4())
+    rtsp_url = get_rtsp_url(fmt)
+    _sessions[session_id] = SessionInfo(rtsp_url, fmt)
+    stream_url = f"/camera/stream/live?session_id={session_id}"
+    return JSONResponse({
         "session_id": session_id,
-        "http_url": http_url
+        "stream_url": stream_url,
+        "format": fmt
     })
 
-@app.route("/camera/stream/live", methods=["GET"])
-def camera_stream_live():
-    session_id = request.args.get('session_id')
-    if not session_id:
-        return abort(400, description="Missing session_id")
-    with active_streams_lock:
-        stream_info = active_streams.get(session_id)
-        if not stream_info or not stream_info['active']:
-            return abort(404, description="Session not found or not active")
-    return Response(
-        generate_mjpeg_frames(session_id),
-        mimetype='multipart/x-mixed-replace; boundary=frame'
+async def mjpeg_streamer(session: SessionInfo):
+    """Proxy RTSP H.264 or MJPEG to HTTP multipart/x-mixed-replace MJPEG."""
+    try:
+        async with session.lock:
+            if not session.container:
+                # Open the RTSP stream via PyAV
+                session.container = av.open(session.rtsp_url, timeout=5)
+        video_stream = next(s for s in session.container.streams if s.type == "video")
+        for frame in session.container.decode(video_stream):
+            if not session.active:
+                break
+            # Convert frame to JPEG
+            jpg = frame.to_image()
+            import io
+            buf = io.BytesIO()
+            jpg.save(buf, format='JPEG')
+            part = (
+                b'--frame\r\n'
+                b'Content-Type: image/jpeg\r\n\r\n' +
+                buf.getvalue() + b'\r\n'
+            )
+            yield part
+            await asyncio.sleep(0.001)
+    except Exception:
+        pass
+    finally:
+        if session.container:
+            session.container.close()
+            session.container = None
+
+async def h264_streamer(session: SessionInfo):
+    """Proxy RTSP H.264 to HTTP as fragmented MP4 stream."""
+    # We encode a minimal MP4 stream for browser
+    try:
+        async with session.lock:
+            if not session.container:
+                session.container = av.open(session.rtsp_url, timeout=5)
+        output = av.open(
+            None, 'w', format='mp4',
+            options={'movflags': 'frag_keyframe+empty_moov'}
+        )
+        video_stream_in = next(s for s in session.container.streams if s.type == 'video')
+        video_stream_out = output.add_stream(template=video_stream_in)
+        for frame in session.container.decode(video_stream_in):
+            if not session.active:
+                break
+            for packet in video_stream_out.encode(frame):
+                yield packet.to_bytes()
+            await asyncio.sleep(0.001)
+        # Flush encoder
+        for packet in video_stream_out.encode():
+            yield packet.to_bytes()
+    except Exception:
+        pass
+    finally:
+        if session.container:
+            session.container.close()
+            session.container = None
+
+@app.get("/camera/stream/live")
+async def camera_stream_live(request: Request, session_id: str):
+    session = _sessions.get(session_id)
+    if not session or not session.active:
+        raise HTTPException(status_code=404, detail="Session not found or inactive")
+    fmt = session.format
+    mime = get_stream_mime(fmt)
+    if fmt == "mjpeg":
+        streamer = mjpeg_streamer
+    elif fmt == "h264":
+        streamer = h264_streamer
+    else:
+        raise HTTPException(status_code=400, detail="Unsupported format")
+    return StreamingResponse(
+        streamer(session),
+        media_type=mime
     )
 
-@app.route("/camera/stream/terminate", methods=["POST"])
-def camera_stream_terminate():
-    session_id = request.args.get('session_id') or request.json.get('session_id') if request.is_json else None
-    if not session_id:
-        return abort(400, description="Missing session_id")
-    stop_stream(session_id)
-    return jsonify({"status": "terminated", "session_id": session_id})
+@app.post("/camera/stream/terminate")
+async def camera_stream_terminate(req: TerminateRequest):
+    session_id = req.session_id
+    session = _sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    session.active = False
+    async with session.lock:
+        if session.container:
+            session.container.close()
+            session.container = None
+    del _sessions[session_id]
+    return JSONResponse({"status": "terminated"})
 
-@app.route("/stream/stop", methods=["POST"])
-def stream_stop():
-    session_id = request.args.get('session_id') or request.json.get('session_id') if request.is_json else None
-    if not session_id:
-        return abort(400, description="Missing session_id")
-    stop_stream(session_id)
-    return jsonify({"status": "stopped", "session_id": session_id})
+@app.post("/stream/stop")
+async def stream_stop(session_id: str):
+    session = _sessions.get(session_id)
+    if not session:
+        raise HTTPException(status_code=404, detail="Session not found")
+    session.active = False
+    async with session.lock:
+        if session.container:
+            session.container.close()
+            session.container = None
+    del _sessions[session_id]
+    return JSONResponse({"status": "stopped"})
 
 if __name__ == "__main__":
-    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
+    import uvicorn
+    uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT)
+```
