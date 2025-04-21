@@ -1,79 +1,96 @@
 import os
 import threading
-import cv2
 import time
-import io
+import cv2
 import requests
 from flask import Flask, Response, jsonify, send_file
+from io import BytesIO
 
-# Environment variables
-DEVICE_IP = os.environ.get('DEVICE_IP')
-RTSP_PORT = int(os.environ.get('RTSP_PORT', 554))
-RTSP_USER = os.environ.get('RTSP_USER', 'admin')
-RTSP_PASS = os.environ.get('RTSP_PASS', '12345')
-CHANNEL = os.environ.get('CAMERA_CHANNEL', '101')
-SNAPSHOT_PORT = int(os.environ.get('SNAPSHOT_PORT', 80))
+# Config via environment variables
+DEVICE_IP = os.environ.get('DEVICE_IP', '192.168.1.64')
+DEVICE_RTSP_PORT = int(os.environ.get('DEVICE_RTSP_PORT', '554'))
+DEVICE_HTTP_PORT = int(os.environ.get('DEVICE_HTTP_PORT', '80'))
+DEVICE_USERNAME = os.environ.get('DEVICE_USERNAME', 'admin')
+DEVICE_PASSWORD = os.environ.get('DEVICE_PASSWORD', '12345')
+
 SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.environ.get('SERVER_PORT', 8080))
+SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
 
-# RTSP URL format for Hikvision
-RTSP_URL = f"rtsp://{RTSP_USER}:{RTSP_PASS}@{DEVICE_IP}:{RTSP_PORT}/Streaming/Channels/{CHANNEL}"
+RTSP_PATH = os.environ.get('DEVICE_RTSP_PATH', 'Streaming/Channels/101')
+RTSP_TRANSPORT = os.environ.get('DEVICE_RTSP_TRANSPORT', 'tcp')  # or 'udp'
 
-# Snapshot URL (ISAPI)
-SNAPSHOT_URL = f"http://{RTSP_USER}:{RTSP_PASS}@{DEVICE_IP}:{SNAPSHOT_PORT}/ISAPI/Streaming/channels/{CHANNEL}/picture"
+SNAPSHOT_PATH = os.environ.get('DEVICE_SNAPSHOT_PATH', '/ISAPI/Streaming/channels/101/picture')
+ISAPI_SNAPSHOT = os.environ.get('DEVICE_USE_ISAPI_SNAPSHOT', 'true').lower() == 'true'
 
+# Flask setup
 app = Flask(__name__)
 
-def mjpeg_stream():
-    cap = cv2.VideoCapture(RTSP_URL)
+def build_rtsp_url():
+    return f'rtsp://{DEVICE_USERNAME}:{DEVICE_PASSWORD}@{DEVICE_IP}:{DEVICE_RTSP_PORT}/{RTSP_PATH}'
+
+@app.route('/camera/rtsp-url', methods=['GET'])
+def get_rtsp_url():
+    return jsonify({
+        "rtsp_url": build_rtsp_url()
+    })
+
+def gen_mjpeg_stream():
+    rtsp_url = build_rtsp_url()
+
+    cap = cv2.VideoCapture(rtsp_url)
     if not cap.isOpened():
-        yield b"--frame\r\nContent-Type: image/jpeg\r\n\r\n" + b"" + b"\r\n"
+        yield b''
         return
+
     try:
         while True:
             ret, frame = cap.read()
-            if not ret:
-                time.sleep(0.25)
+            if not ret or frame is None:
+                time.sleep(0.05)
                 continue
-            # Encode as JPEG
-            ret, jpeg = cv2.imencode('.jpg', frame)
-            if not ret:
+            ret2, jpeg = cv2.imencode('.jpg', frame)
+            if not ret2:
                 continue
-            frame_bytes = jpeg.tobytes()
+            jpg_bytes = jpeg.tobytes()
             yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+                   b'Content-Type: image/jpeg\r\n\r\n' + jpg_bytes + b'\r\n')
     finally:
         cap.release()
 
-@app.route('/camera/live')
+@app.route('/camera/live', methods=['GET'])
 def camera_live():
-    return Response(mjpeg_stream(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+    return Response(
+        gen_mjpeg_stream(),
+        mimetype='multipart/x-mixed-replace; boundary=frame'
+    )
 
-@app.route('/camera/rtsp-url')
-def camera_rtsp_url():
-    return jsonify({
-        "rtsp_url": RTSP_URL
-    })
-
-@app.route('/camera/snapshot')
-def camera_snapshot():
-    # Try to fetch snapshot via HTTP API
-    try:
-        resp = requests.get(SNAPSHOT_URL, stream=True, timeout=5)
-        if resp.status_code == 200 and resp.headers.get('Content-Type', '').startswith('image/jpeg'):
-            return Response(resp.content, content_type='image/jpeg')
-    except Exception:
-        pass
-    # Fallback: Capture from RTSP
-    cap = cv2.VideoCapture(RTSP_URL)
+def get_snapshot_jpeg():
+    if ISAPI_SNAPSHOT:
+        url = f'http://{DEVICE_IP}:{DEVICE_HTTP_PORT}{SNAPSHOT_PATH}'
+        try:
+            resp = requests.get(url, auth=(DEVICE_USERNAME, DEVICE_PASSWORD), timeout=5)
+            if resp.status_code == 200 and resp.headers.get('Content-Type', '').startswith('image/jpeg'):
+                return resp.content
+        except Exception:
+            pass
+    # fallback: use RTSP/mjpeg and grab a single frame
+    rtsp_url = build_rtsp_url()
+    cap = cv2.VideoCapture(rtsp_url)
     ret, frame = cap.read()
+    result = None
+    if ret and frame is not None:
+        ret2, jpeg = cv2.imencode('.jpg', frame)
+        if ret2:
+            result = jpeg.tobytes()
     cap.release()
-    if ret:
-        ret, jpeg = cv2.imencode('.jpg', frame)
-        if ret:
-            return Response(jpeg.tobytes(), content_type='image/jpeg')
-    return Response("Could not obtain snapshot", status=503)
+    return result
 
-if __name__ == "__main__":
+@app.route('/camera/snapshot', methods=['GET'])
+def camera_snapshot():
+    jpeg = get_snapshot_jpeg()
+    if jpeg is None:
+        return 'Failed to capture snapshot', 503
+    return Response(jpeg, mimetype='image/jpeg')
+
+if __name__ == '__main__':
     app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
