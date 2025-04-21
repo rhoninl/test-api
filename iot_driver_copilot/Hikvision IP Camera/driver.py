@@ -1,60 +1,77 @@
-```python
 import os
-import asyncio
-import aiohttp
+import threading
+import queue
+import time
 import cv2
-import av
-import numpy as np
-from aiohttp import web
+from flask import Flask, Response, stream_with_context
 
-# Environment Variables
+# Environment variables for configuration
 DEVICE_IP = os.environ.get('DEVICE_IP', '192.168.1.64')
-RTSP_PORT = int(os.environ.get('RTSP_PORT', '554'))
-RTSP_USER = os.environ.get('RTSP_USER', 'admin')
-RTSP_PASSWORD = os.environ.get('RTSP_PASSWORD', '12345')
+DEVICE_RTSP_PORT = int(os.environ.get('DEVICE_RTSP_PORT', '554'))
+DEVICE_RTSP_USER = os.environ.get('DEVICE_RTSP_USER', 'admin')
+DEVICE_RTSP_PASS = os.environ.get('DEVICE_RTSP_PASS', '12345')
+DEVICE_RTSP_PATH = os.environ.get('DEVICE_RTSP_PATH', '/Streaming/Channels/101')
 SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
 SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
-RTSP_PATH = os.environ.get('RTSP_PATH', 'Streaming/Channels/101')
 
-RTSP_URL = f"rtsp://{RTSP_USER}:{RTSP_PASSWORD}@{DEVICE_IP}:{RTSP_PORT}/{RTSP_PATH}"
+RTSP_URL = f"rtsp://{DEVICE_RTSP_USER}:{DEVICE_RTSP_PASS}@{DEVICE_IP}:{DEVICE_RTSP_PORT}{DEVICE_RTSP_PATH}"
 
-# Async generator to yield multipart JPEG frames
-async def mjpeg_stream():
-    # OpenCV VideoCapture is blocking, so we use av.open in a thread
-    container = None
+# MJPEG streaming settings
+FRAME_QUEUE_SIZE = int(os.environ.get('FRAME_QUEUE_SIZE', '8'))
+FPS = int(os.environ.get('FPS', '10'))
+
+app = Flask(__name__)
+
+frame_queue = queue.Queue(maxsize=FRAME_QUEUE_SIZE)
+stop_event = threading.Event()
+
+def rtsp_to_mjpeg_worker():
+    cap = cv2.VideoCapture(RTSP_URL)
+    if not cap.isOpened():
+        return
     try:
-        container = av.open(RTSP_URL)
-        stream = next(s for s in container.streams if s.type == 'video')
-        for frame in container.decode(stream):
-            img = frame.to_ndarray(format='bgr24')
-            ret, jpeg = cv2.imencode('.jpg', img)
+        while not stop_event.is_set():
+            ret, frame = cap.read()
             if not ret:
                 continue
-            data = jpeg.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + data + b'\r\n')
-            await asyncio.sleep(0.04)  # ~25 fps
-    except Exception:
-        pass
+            ret, jpeg = cv2.imencode('.jpg', frame)
+            if not ret:
+                continue
+            try:
+                if frame_queue.full():
+                    frame_queue.get_nowait()
+                frame_queue.put_nowait(jpeg.tobytes())
+            except queue.Full:
+                pass
+            time.sleep(1.0 / FPS)
     finally:
-        if container:
-            container.close()
+        cap.release()
 
-async def stream_handler(request):
-    headers = {
-        'Content-Type': 'multipart/x-mixed-replace; boundary=frame',
-        'Cache-Control': 'no-cache',
-        'Pragma': 'no-cache',
-    }
-    response = web.StreamResponse(status=200, reason='OK', headers=headers)
-    await response.prepare(request)
-    async for frame in mjpeg_stream():
-        await response.write(frame)
-    return response
+def mjpeg_stream_generator():
+    while not stop_event.is_set():
+        try:
+            frame = frame_queue.get(timeout=2)
+        except queue.Empty:
+            continue
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
 
-app = web.Application()
-app.router.add_get('/stream', stream_handler)
+@app.route('/stream', methods=['GET'])
+def stream():
+    return Response(
+        stream_with_context(mjpeg_stream_generator()),
+        mimetype='multipart/x-mixed-replace; boundary=frame'
+    )
+
+def start_rtsp_thread():
+    t = threading.Thread(target=rtsp_to_mjpeg_worker, daemon=True)
+    t.start()
+    return t
 
 if __name__ == '__main__':
-    web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
-```
+    rtsp_thread = start_rtsp_thread()
+    try:
+        app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
+    finally:
+        stop_event.set()
+        rtsp_thread.join(timeout=5)
