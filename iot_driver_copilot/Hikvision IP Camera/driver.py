@@ -1,47 +1,52 @@
 import os
-import io
 import threading
 import queue
-
-from flask import Flask, Response, request, abort
-import cv2
+import time
+from http.server import BaseHTTPRequestHandler, HTTPServer
+import socketserver
+import base64
 import requests
+import cv2
+import numpy as np
 
-# Environment variable configuration
-CAMERA_IP = os.environ.get('CAMERA_IP')
-RTSP_PORT = int(os.environ.get('RTSP_PORT', 554))
-RTSP_PATH = os.environ.get('RTSP_PATH', '/Streaming/Channels/101')
-RTSP_USER = os.environ.get('RTSP_USER', '')
-RTSP_PASS = os.environ.get('RTSP_PASS', '')
-
-HTTP_SNAPSHOT_PORT = int(os.environ.get('HTTP_SNAPSHOT_PORT', 80))
-SNAPSHOT_PATH = os.environ.get('SNAPSHOT_PATH', '/ISAPI/Streaming/channels/101/picture')
-SNAPSHOT_USER = os.environ.get('SNAPSHOT_USER', RTSP_USER)
-SNAPSHOT_PASS = os.environ.get('SNAPSHOT_PASS', RTSP_PASS)
+# Configuration from environment
+DEVICE_IP = os.environ.get('DEVICE_IP', '192.168.1.64')
+DEVICE_RTSP_PORT = int(os.environ.get('DEVICE_RTSP_PORT', '554'))
+DEVICE_RTSP_USER = os.environ.get('DEVICE_RTSP_USER', 'admin')
+DEVICE_RTSP_PASS = os.environ.get('DEVICE_RTSP_PASS', '12345')
+DEVICE_HTTP_PORT = int(os.environ.get('DEVICE_HTTP_PORT', '80'))
 
 SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.environ.get('SERVER_PORT', 8080))
+SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
 
-app = Flask(__name__)
+RTSP_PATH = os.environ.get('RTSP_PATH', '/Streaming/Channels/101')
+RTSP_PARAMS = os.environ.get('RTSP_PARAMS', '')  # e.g. '?transportmode=unicast'
 
-# Shared state for stream
-streaming_thread = None
-streaming_active = threading.Event()
+# RTSP URL Construction
+if DEVICE_RTSP_USER and DEVICE_RTSP_PASS:
+    RTSP_URL = f'rtsp://{DEVICE_RTSP_USER}:{DEVICE_RTSP_PASS}@{DEVICE_IP}:{DEVICE_RTSP_PORT}{RTSP_PATH}{RTSP_PARAMS}'
+else:
+    RTSP_URL = f'rtsp://{DEVICE_IP}:{DEVICE_RTSP_PORT}{RTSP_PATH}{RTSP_PARAMS}'
+
+# HTTP snapshot URL
+SNAPSHOT_URL = f'http://{DEVICE_IP}:{DEVICE_HTTP_PORT}/ISAPI/Streaming/channels/101/picture'
+
+# Streaming control
+streaming_active = False
+streaming_lock = threading.Lock()
 frame_queue = queue.Queue(maxsize=10)
+stream_thread = None
 
-def get_rtsp_url():
-    auth = ''
-    if RTSP_USER and RTSP_PASS:
-        auth = f'{RTSP_USER}:{RTSP_PASS}@'
-    return f'rtsp://{auth}{CAMERA_IP}:{RTSP_PORT}{RTSP_PATH}'
 
-def get_snapshot_url():
-    return f'http://{CAMERA_IP}:{HTTP_SNAPSHOT_PORT}{SNAPSHOT_PATH}'
-
-def rtsp_stream_worker(url):
-    cap = cv2.VideoCapture(url)
+def fetch_rtsp_stream():
+    global streaming_active
+    cap = None
     try:
-        while streaming_active.is_set():
+        cap = cv2.VideoCapture(RTSP_URL)
+        if not cap.isOpened():
+            streaming_active = False
+            return
+        while streaming_active:
             ret, frame = cap.read()
             if not ret:
                 continue
@@ -49,68 +54,128 @@ def rtsp_stream_worker(url):
             ret, jpeg = cv2.imencode('.jpg', frame)
             if not ret:
                 continue
-            # Put frame in queue
             try:
-                frame_queue.put(jpeg.tobytes(), timeout=0.1)
+                frame_queue.put(jpeg.tobytes(), timeout=1)
             except queue.Full:
                 pass  # Drop frame if queue is full
     finally:
-        cap.release()
-        with frame_queue.mutex:
-            frame_queue.queue.clear()
+        if cap:
+            cap.release()
 
-def generate_mjpeg():
-    while streaming_active.is_set():
-        try:
-            frame = frame_queue.get(timeout=1)
-        except queue.Empty:
-            continue
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
 
-@app.route('/stream', methods=['PUT', 'DELETE'])
-def stream_control():
-    global streaming_thread
-    if request.method == 'PUT':
-        if streaming_active.is_set():
-            return ('{"result": "already streaming"}', 200, {'Content-Type': 'application/json'})
-        # Start streaming thread
-        streaming_active.set()
-        rtsp_url = get_rtsp_url()
-        streaming_thread = threading.Thread(target=rtsp_stream_worker, args=(rtsp_url,), daemon=True)
-        streaming_thread.start()
-        return ('{"result": "stream started"}', 200, {'Content-Type': 'application/json'})
-    elif request.method == 'DELETE':
-        streaming_active.clear()
-        if streaming_thread and streaming_thread.is_alive():
-            streaming_thread.join(timeout=2)
-        with frame_queue.mutex:
-            frame_queue.queue.clear()
-        return ('{"result": "stream stopped"}', 200, {'Content-Type': 'application/json'})
-    else:
-        abort(405)
-
-@app.route('/stream', methods=['GET'])
-def stream_view():
-    if not streaming_active.is_set():
-        return ('{"error": "stream not started"}', 400, {'Content-Type': 'application/json'})
-    return Response(generate_mjpeg(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
-
-@app.route('/snapshot', methods=['GET'])
-def snapshot():
-    url = get_snapshot_url()
-    auth = None
-    if SNAPSHOT_USER and SNAPSHOT_PASS:
-        auth = (SNAPSHOT_USER, SNAPSHOT_PASS)
-    try:
-        resp = requests.get(url, auth=auth, timeout=5)
-        if resp.status_code == 200 and resp.headers.get('Content-Type', '').startswith('image'):
-            return Response(resp.content, mimetype='image/jpeg')
+class CameraHTTPRequestHandler(BaseHTTPRequestHandler):
+    def do_PUT(self):
+        if self.path == '/stream':
+            self.handle_start_stream()
         else:
-            abort(502)
-    except Exception:
-        abort(504)
+            self.send_error(404, 'Not Found')
+
+    def do_DELETE(self):
+        if self.path == '/stream':
+            self.handle_stop_stream()
+        else:
+            self.send_error(404, 'Not Found')
+
+    def do_GET(self):
+        if self.path == '/snapshot':
+            self.handle_snapshot()
+        elif self.path == '/stream':
+            self.handle_stream()
+        else:
+            self.send_error(404, 'Not Found')
+
+    def handle_start_stream(self):
+        global streaming_active, stream_thread
+        with streaming_lock:
+            if not streaming_active:
+                streaming_active = True
+                stream_thread = threading.Thread(target=fetch_rtsp_stream, daemon=True)
+                stream_thread.start()
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"status": "stream started"}')
+            else:
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"status": "stream already running"}')
+
+    def handle_stop_stream(self):
+        global streaming_active, stream_thread
+        with streaming_lock:
+            if streaming_active:
+                streaming_active = False
+                # Give thread some time to clean up
+                if stream_thread is not None:
+                    stream_thread.join(timeout=2)
+                # Empty frame queue
+                while not frame_queue.empty():
+                    try:
+                        frame_queue.get_nowait()
+                    except queue.Empty:
+                        break
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"status": "stream stopped"}')
+            else:
+                self.send_response(200)
+                self.end_headers()
+                self.wfile.write(b'{"status": "no active stream"}')
+
+    def handle_snapshot(self):
+        auth = None
+        if DEVICE_RTSP_USER and DEVICE_RTSP_PASS:
+            auth = (DEVICE_RTSP_USER, DEVICE_RTSP_PASS)
+        headers = {
+            'Accept': 'image/jpeg'
+        }
+        try:
+            resp = requests.get(SNAPSHOT_URL, auth=auth, headers=headers, timeout=3)
+            if resp.status_code == 200:
+                self.send_response(200)
+                self.send_header('Content-type', 'image/jpeg')
+                self.end_headers()
+                self.wfile.write(resp.content)
+            else:
+                self.send_error(502, f"Camera returned status code {resp.status_code}")
+        except Exception as e:
+            self.send_error(502, f"Snapshot error: {str(e)}")
+
+    def handle_stream(self):
+        global streaming_active
+        with streaming_lock:
+            if not streaming_active:
+                self.send_error(409, 'Stream not started. PUT /stream first.')
+                return
+        self.send_response(200)
+        self.send_header('Content-type', 'multipart/x-mixed-replace; boundary=frame')
+        self.end_headers()
+        try:
+            while streaming_active:
+                try:
+                    frame = frame_queue.get(timeout=2)
+                except queue.Empty:
+                    continue
+                self.wfile.write(b'--frame\r\n')
+                self.wfile.write(b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+                time.sleep(0.04)  # ~25fps limit
+        except Exception:
+            pass
+
+    def log_message(self, format, *args):
+        # Suppress default logging
+        return
+
+
+class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+
+def run_server():
+    server_address = (SERVER_HOST, SERVER_PORT)
+    httpd = ThreadedHTTPServer(server_address, CameraHTTPRequestHandler)
+    print(f"Starting server at http://{SERVER_HOST}:{SERVER_PORT}")
+    httpd.serve_forever()
+
 
 if __name__ == '__main__':
-    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
+    run_server()
