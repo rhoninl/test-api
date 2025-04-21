@@ -1,81 +1,60 @@
+```python
 import os
-import io
-import threading
-import queue
-import time
-from flask import Flask, Response, stream_with_context
-
+import asyncio
+import aiohttp
 import cv2
+import av
+import numpy as np
+from aiohttp import web
 
-# Configuration from environment variables
-DEVICE_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
-RTSP_PORT = int(os.environ.get("RTSP_PORT", "554"))
-RTSP_USERNAME = os.environ.get("RTSP_USERNAME", "")
-RTSP_PASSWORD = os.environ.get("RTSP_PASSWORD", "")
-RTSP_PATH = os.environ.get("RTSP_PATH", "Streaming/Channels/101")
-SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
+# Environment Variables
+DEVICE_IP = os.environ.get('DEVICE_IP', '192.168.1.64')
+RTSP_PORT = int(os.environ.get('RTSP_PORT', '554'))
+RTSP_USER = os.environ.get('RTSP_USER', 'admin')
+RTSP_PASSWORD = os.environ.get('RTSP_PASSWORD', '12345')
+SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
+SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
+RTSP_PATH = os.environ.get('RTSP_PATH', 'Streaming/Channels/101')
 
-# Build RTSP URL
-if RTSP_USERNAME and RTSP_PASSWORD:
-    RTSP_URL = f"rtsp://{RTSP_USERNAME}:{RTSP_PASSWORD}@{DEVICE_IP}:{RTSP_PORT}/{RTSP_PATH}"
-else:
-    RTSP_URL = f"rtsp://{DEVICE_IP}:{RTSP_PORT}/{RTSP_PATH}"
+RTSP_URL = f"rtsp://{RTSP_USER}:{RTSP_PASSWORD}@{DEVICE_IP}:{RTSP_PORT}/{RTSP_PATH}"
 
-app = Flask(__name__)
-
-# Global queue for communication between capture thread and HTTP stream
-frame_queues = {}
-
-def rtsp_frame_reader(rtsp_url, client_id, frame_queue):
-    cap = cv2.VideoCapture(rtsp_url)
-    if not cap.isOpened():
-        frame_queue.put(None)
-        return
+# Async generator to yield multipart JPEG frames
+async def mjpeg_stream():
+    # OpenCV VideoCapture is blocking, so we use av.open in a thread
+    container = None
     try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                # End of stream or error
-                frame_queue.put(None)
-                break
-            # Encode frame as JPEG
-            ret, jpeg = cv2.imencode('.jpg', frame)
+        container = av.open(RTSP_URL)
+        stream = next(s for s in container.streams if s.type == 'video')
+        for frame in container.decode(stream):
+            img = frame.to_ndarray(format='bgr24')
+            ret, jpeg = cv2.imencode('.jpg', img)
             if not ret:
                 continue
-            # Put JPEG bytes in queue
-            try:
-                frame_queue.put(jpeg.tobytes(), timeout=2)
-            except queue.Full:
-                continue
-    finally:
-        cap.release()
-
-def generate_mjpeg_stream(client_id):
-    frame_queue = frame_queues[client_id]
-    try:
-        while True:
-            frame = frame_queue.get()
-            if frame is None:
-                break
+            data = jpeg.tobytes()
             yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+                   b'Content-Type: image/jpeg\r\n\r\n' + data + b'\r\n')
+            await asyncio.sleep(0.04)  # ~25 fps
+    except Exception:
+        pass
     finally:
-        del frame_queues[client_id]
+        if container:
+            container.close()
 
-@app.route('/stream', methods=['GET'])
-def stream():
-    client_id = str(time.time()) + str(threading.get_ident())
-    frame_queue = queue.Queue(maxsize=10)
-    frame_queues[client_id] = frame_queue
+async def stream_handler(request):
+    headers = {
+        'Content-Type': 'multipart/x-mixed-replace; boundary=frame',
+        'Cache-Control': 'no-cache',
+        'Pragma': 'no-cache',
+    }
+    response = web.StreamResponse(status=200, reason='OK', headers=headers)
+    await response.prepare(request)
+    async for frame in mjpeg_stream():
+        await response.write(frame)
+    return response
 
-    t = threading.Thread(target=rtsp_frame_reader, args=(RTSP_URL, client_id, frame_queue), daemon=True)
-    t.start()
-
-    return Response(
-        stream_with_context(generate_mjpeg_stream(client_id)),
-        mimetype='multipart/x-mixed-replace; boundary=frame'
-    )
+app = web.Application()
+app.router.add_get('/stream', stream_handler)
 
 if __name__ == '__main__':
-    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
+    web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
+```
