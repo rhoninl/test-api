@@ -1,74 +1,86 @@
 import os
-import asyncio
-import aiohttp
-import aiohttp.web
+import threading
 import cv2
-import numpy as np
+import queue
+from flask import Flask, Response, abort
 
-# Environment variables
-CAMERA_IP = os.environ.get("CAMERA_IP", "127.0.0.1")
-CAMERA_RTSP_PORT = int(os.environ.get("CAMERA_RTSP_PORT", 554))
-CAMERA_RTSP_USER = os.environ.get("CAMERA_RTSP_USER", "admin")
-CAMERA_RTSP_PASSWORD = os.environ.get("CAMERA_RTSP_PASSWORD", "admin")
-CAMERA_CHANNEL = os.environ.get("CAMERA_CHANNEL", "1")
-CAMERA_STREAM = os.environ.get("CAMERA_STREAM", "1")
-SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", 8080))
+# Load configuration from environment variables
+CAMERA_RTSP_IP = os.environ.get('CAMERA_RTSP_IP', '192.168.1.64')
+CAMERA_RTSP_PORT = os.environ.get('CAMERA_RTSP_PORT', '554')
+CAMERA_RTSP_USER = os.environ.get('CAMERA_RTSP_USER', 'admin')
+CAMERA_RTSP_PASSWORD = os.environ.get('CAMERA_RTSP_PASSWORD', '12345')
+CAMERA_RTSP_PATH = os.environ.get('CAMERA_RTSP_PATH', 'Streaming/Channels/101')
+SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
+SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
 
-# Construct RTSP URL for Hikvision
-RTSP_URL = (
-    f"rtsp://{CAMERA_RTSP_USER}:{CAMERA_RTSP_PASSWORD}@{CAMERA_IP}:{CAMERA_RTSP_PORT}"
-    f"/Streaming/Channels/{CAMERA_CHANNEL}0{CAMERA_STREAM}"
-)
+# Build RTSP URL
+RTSP_URL = f'rtsp://{CAMERA_RTSP_USER}:{CAMERA_RTSP_PASSWORD}@{CAMERA_RTSP_IP}:{CAMERA_RTSP_PORT}/{CAMERA_RTSP_PATH}'
 
-BOUNDARY = "frameboundary"
+app = Flask(__name__)
 
-async def stream_generator():
-    cap = cv2.VideoCapture(RTSP_URL)
-    if not cap.isOpened():
-        yield (
-            b"--" + BOUNDARY.encode() + b"\r\n"
-            b"Content-Type: text/plain\r\n\r\n"
-            b"Could not connect to camera stream\r\n"
-        )
-        return
-    try:
-        while True:
+class RTSPStream:
+    def __init__(self, src, max_queue=128):
+        self.src = src
+        self.frame_queue = queue.Queue(maxsize=max_queue)
+        self.running = False
+        self.thread = None
+        self.lock = threading.Lock()
+
+    def start(self):
+        with self.lock:
+            if not self.running:
+                self.running = True
+                self.thread = threading.Thread(target=self.update, daemon=True)
+                self.thread.start()
+
+    def stop(self):
+        with self.lock:
+            self.running = False
+        if self.thread:
+            self.thread.join()
+            self.thread = None
+
+    def update(self):
+        cap = cv2.VideoCapture(self.src)
+        if not cap.isOpened():
+            self.running = False
+            return
+        while self.running:
             ret, frame = cap.read()
             if not ret:
-                await asyncio.sleep(0.1)
-                continue
+                break
             # Encode frame as JPEG
-            ret, jpeg = cv2.imencode(".jpg", frame)
+            ret, jpeg = cv2.imencode('.jpg', frame)
             if not ret:
-                await asyncio.sleep(0.01)
                 continue
-            data = jpeg.tobytes()
-            yield (
-                b"--" + BOUNDARY.encode() + b"\r\n"
-                b"Content-Type: image/jpeg\r\n"
-                b"Content-Length: " + str(len(data)).encode() + b"\r\n\r\n" +
-                data + b"\r\n"
-            )
-            await asyncio.sleep(0.04)  # ~25 FPS
-    finally:
+            try:
+                if self.frame_queue.full():
+                    self.frame_queue.get_nowait()
+                self.frame_queue.put_nowait(jpeg.tobytes())
+            except queue.Full:
+                pass
         cap.release()
 
-async def stream_handler(request):
-    headers = {
-        "Content-Type": f"multipart/x-mixed-replace; boundary={BOUNDARY}",
-        "Cache-Control": "no-cache",
-        "Pragma": "no-cache",
-        "Connection": "close",
-    }
-    resp = aiohttp.web.StreamResponse(status=200, reason='OK', headers=headers)
-    await resp.prepare(request)
-    async for chunk in stream_generator():
-        await resp.write(chunk)
-    return resp
+    def get_frame(self):
+        try:
+            return self.frame_queue.get(timeout=1)
+        except queue.Empty:
+            return None
 
-app = aiohttp.web.Application()
-app.router.add_get('/stream', stream_handler)
+rtsp_stream = RTSPStream(RTSP_URL)
 
-if __name__ == "__main__":
-    aiohttp.web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
+@app.route('/stream', methods=['GET'])
+def stream_video():
+    def gen():
+        rtsp_stream.start()
+        while True:
+            frame = rtsp_stream.get_frame()
+            if frame is None:
+                continue
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+    return Response(gen(), mimetype='multipart/x-mixed-replace; boundary=frame')
+
+if __name__ == '__main__':
+    rtsp_stream.start()
+    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
