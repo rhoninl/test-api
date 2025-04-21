@@ -1,171 +1,102 @@
 import os
 import json
-import asyncio
-from urllib.parse import urlencode
-from typing import Optional, Dict, Any
+import requests
+from flask import Flask, request, Response, jsonify, stream_with_context
+from functools import wraps
 
-from fastapi import FastAPI, Request, Response, Header, WebSocket, WebSocketDisconnect, status
-from fastapi.responses import JSONResponse, StreamingResponse
-from fastapi.middleware.cors import CORSMiddleware
-import httpx
+# Configuration from environment variables
+DEVICE_HOST = os.environ.get('DEVICE_HOST', 'localhost')
+DEVICE_PORT = os.environ.get('DEVICE_PORT', '80')
+DEVICE_PROTOCOL = os.environ.get('DEVICE_PROTOCOL', 'http')
+SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
+SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
 
-# Environment Variables
-DEVICE_HOST = os.getenv('DEVICE_HOST', 'localhost')
-DEVICE_PORT = int(os.getenv('DEVICE_PORT', 8000))
-DEVICE_PROTOCOL = os.getenv('DEVICE_PROTOCOL', 'http').lower()
-SERVER_HOST = os.getenv('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.getenv('SERVER_PORT', 8080))
-SERVER_HTTP_PORT = int(os.getenv('SERVER_HTTP_PORT', SERVER_PORT))  # Only HTTP is implemented
+# Construct device API base URL
+DEVICE_API_BASE = f"{DEVICE_PROTOCOL}://{DEVICE_HOST}:{DEVICE_PORT}"
 
-# Compose device base URL
-DEVICE_BASE = f"{DEVICE_PROTOCOL}://{DEVICE_HOST}:{DEVICE_PORT}"
+app = Flask(__name__)
+app.config['JSON_SORT_KEYS'] = False
 
-app = FastAPI()
+# Helper to forward headers (for auth)
+def get_auth_header():
+    auth = request.headers.get('Authorization')
+    if auth:
+        return {"Authorization": auth}
+    return {}
 
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
+# Decorator to proxy authentication
+def require_auth_proxy(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        # Optionally add more sophisticated session/token management here
+        return f(*args, **kwargs)
+    return decorated
 
-async def proxy_request(
-    method: str,
-    path: str,
-    headers: Dict[str, str],
-    query: Optional[Dict[str, Any]] = None,
-    body: Any = None,
-    stream: bool = False
-):
-    url = f"{DEVICE_BASE}{path}"
-    if query:
-        url += '?' + urlencode(query, doseq=True)
-    async with httpx.AsyncClient() as client:
-        req_headers = {k: v for k, v in headers.items() if k.lower() != 'host'}
-        if stream:
-            resp = await client.request(method, url, headers=req_headers, content=body, stream=True)
-            return resp
-        else:
-            resp = await client.request(method, url, headers=req_headers, content=body)
-            return resp
+@app.route('/session/login', methods=['POST'])
+def session_login():
+    # Proxy login to device
+    data = request.get_json(force=True)
+    resp = requests.post(f"{DEVICE_API_BASE}/session/login", json=data)
+    return Response(resp.content, status=resp.status_code, content_type=resp.headers.get('Content-Type', 'application/json'))
 
-# --- API Endpoints ---
+@app.route('/session/logout', methods=['POST'])
+@require_auth_proxy
+def session_logout():
+    headers = get_auth_header()
+    resp = requests.post(f"{DEVICE_API_BASE}/session/logout", headers=headers)
+    return Response(resp.content, status=resp.status_code, content_type=resp.headers.get('Content-Type', 'application/json'))
 
-@app.post("/session/login")
-async def session_login(request: Request):
-    body = await request.body()
-    headers = dict(request.headers)
-    resp = await proxy_request("POST", "/session/login", headers, body=body)
-    return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
+@app.route('/schedules', methods=['GET', 'POST'])
+@require_auth_proxy
+def schedules():
+    headers = get_auth_header()
+    if request.method == 'GET':
+        resp = requests.get(f"{DEVICE_API_BASE}/schedules", headers=headers, params=request.args)
+    else:
+        resp = requests.post(f"{DEVICE_API_BASE}/schedules", headers=headers, json=request.get_json(force=True))
+    return Response(resp.content, status=resp.status_code, content_type=resp.headers.get('Content-Type', 'application/json'))
 
-@app.post("/session/logout")
-async def session_logout(request: Request, authorization: Optional[str] = Header(None)):
-    body = await request.body()
-    headers = dict(request.headers)
-    # Ensure Authorization header is passed
-    if authorization:
-        headers['Authorization'] = authorization
-    resp = await proxy_request("POST", "/session/logout", headers, body=body)
-    return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
+@app.route('/posts', methods=['GET', 'POST'])
+@require_auth_proxy
+def posts():
+    headers = get_auth_header()
+    if request.method == 'GET':
+        resp = requests.get(f"{DEVICE_API_BASE}/posts", headers=headers, params=request.args)
+    else:
+        resp = requests.post(f"{DEVICE_API_BASE}/posts", headers=headers, json=request.get_json(force=True))
+    return Response(resp.content, status=resp.status_code, content_type=resp.headers.get('Content-Type', 'application/json'))
 
-@app.get("/schedules")
-async def get_schedules(request: Request):
-    headers = dict(request.headers)
-    query = dict(request.query_params)
-    resp = await proxy_request("GET", "/schedules", headers, query=query)
-    return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
+@app.route('/search', methods=['GET'])
+@require_auth_proxy
+def search():
+    headers = get_auth_header()
+    resp = requests.get(f"{DEVICE_API_BASE}/search", headers=headers, params=request.args)
+    return Response(resp.content, status=resp.status_code, content_type=resp.headers.get('Content-Type', 'application/json'))
 
-@app.post("/schedules")
-async def post_schedules(request: Request):
-    body = await request.body()
-    headers = dict(request.headers)
-    resp = await proxy_request("POST", "/schedules", headers, body=body)
-    return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
+@app.route('/chats/<chatId>/messages', methods=['GET', 'POST'])
+@require_auth_proxy
+def chat_messages(chatId):
+    headers = get_auth_header()
+    if request.method == 'GET':
+        resp = requests.get(f"{DEVICE_API_BASE}/chats/{chatId}/messages", headers=headers, params=request.args)
+    else:
+        resp = requests.post(f"{DEVICE_API_BASE}/chats/{chatId}/messages", headers=headers, json=request.get_json(force=True))
+    return Response(resp.content, status=resp.status_code, content_type=resp.headers.get('Content-Type', 'application/json'))
 
-@app.get("/posts")
-async def get_posts(request: Request):
-    headers = dict(request.headers)
-    query = dict(request.query_params)
-    resp = await proxy_request("GET", "/posts", headers, query=query)
-    return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
-
-@app.post("/posts")
-async def post_posts(request: Request):
-    body = await request.body()
-    headers = dict(request.headers)
-    resp = await proxy_request("POST", "/posts", headers, body=body)
-    return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
-
-@app.get("/search")
-async def get_search(request: Request):
-    headers = dict(request.headers)
-    query = dict(request.query_params)
-    resp = await proxy_request("GET", "/search", headers, query=query)
-    return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
-
-@app.get("/chats/{chatId}/messages")
-async def get_chat_messages(request: Request, chatId: str):
-    headers = dict(request.headers)
-    query = dict(request.query_params)
-    resp = await proxy_request("GET", f"/chats/{chatId}/messages", headers, query=query)
-    return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
-
-@app.post("/chats/{chatId}/messages")
-async def post_chat_message(request: Request, chatId: str):
-    body = await request.body()
-    headers = dict(request.headers)
-    resp = await proxy_request("POST", f"/chats/{chatId}/messages", headers, body=body)
-    return Response(content=resp.content, status_code=resp.status_code, headers=dict(resp.headers))
-
-# WebSocket Proxy (for chat or real-time features)
-@app.websocket("/ws/{path:path}")
-async def websocket_proxy(websocket: WebSocket, path: str):
-    await websocket.accept()
-    # Proxy to device WebSocket
-    device_ws_url = f"{DEVICE_PROTOCOL.replace('http', 'ws')}://{DEVICE_HOST}:{DEVICE_PORT}/{path}"
-    async with httpx.AsyncClient() as client:
-        try:
-            async with client.ws_connect(device_ws_url) as device_ws:
-                async def to_device():
-                    try:
-                        while True:
-                            msg = await websocket.receive_text()
-                            await device_ws.send_text(msg)
-                    except WebSocketDisconnect:
-                        await device_ws.close()
-                    except Exception:
-                        await device_ws.close()
-
-                async def to_client():
-                    try:
-                        while True:
-                            msg = await device_ws.receive_text()
-                            await websocket.send_text(msg)
-                    except Exception:
-                        await websocket.close()
-
-                await asyncio.gather(to_device(), to_client())
-        except Exception:
-            await websocket.close(code=status.WS_1011_INTERNAL_ERROR)
-
-# For browser/command-line access: root endpoint
-@app.get("/")
-async def root():
-    return JSONResponse({
-        "message": "GoSchedule, ChatToChat, Bustub Device HTTP Driver",
+# Provide a root endpoint with minimal info
+@app.route('/', methods=['GET'])
+def index():
+    return jsonify({
+        "name": "GoSchedule/ChatToChat/Bustub HTTP Proxy Driver",
         "endpoints": [
-            "/session/login [POST]",
-            "/session/logout [POST]",
-            "/schedules [GET, POST]",
-            "/posts [GET, POST]",
-            "/search [GET]",
-            "/chats/{chatId}/messages [GET, POST]",
-            "/ws/{path} [WebSocket Proxy]"
-        ],
-        "device_base": DEVICE_BASE
+            {"method": "POST", "path": "/session/login"},
+            {"method": "POST", "path": "/session/logout"},
+            {"method": "GET/POST", "path": "/schedules"},
+            {"method": "GET/POST", "path": "/posts"},
+            {"method": "GET", "path": "/search"},
+            {"method": "GET/POST", "path": "/chats/<chatId>/messages"}
+        ]
     })
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host=SERVER_HOST, port=SERVER_HTTP_PORT)
+if __name__ == '__main__':
+    app.run(host=SERVER_HOST, port=SERVER_PORT)
