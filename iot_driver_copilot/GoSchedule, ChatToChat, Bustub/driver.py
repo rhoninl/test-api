@@ -1,161 +1,100 @@
 import os
 import json
-import asyncio
+from functools import wraps
 from urllib.parse import urlencode
+from flask import Flask, request, jsonify, Response, stream_with_context
+import requests
 
-from aiohttp import web, ClientSession, WSMsgType, ClientWebSocketResponse
-
-# Environment variables
-DEVICE_API_HOST = os.environ.get("DEVICE_API_HOST", "127.0.0.1")
-DEVICE_API_PORT = os.environ.get("DEVICE_API_PORT", "8080")
-DEVICE_API_PROTO = os.environ.get("DEVICE_API_PROTO", "http")
+# Configuration from environment variables
+DEVICE_HOST = os.environ.get("DEVICE_HOST", "localhost")
+DEVICE_PORT = os.environ.get("DEVICE_PORT", "8080")
 SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "8000"))
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "5000"))
+DEVICE_USE_HTTPS = os.environ.get("DEVICE_USE_HTTPS", "false").lower() == "true"
 
-DEVICE_BASE_URL = f"{DEVICE_API_PROTO}://{DEVICE_API_HOST}:{DEVICE_API_PORT}"
+DEVICE_BASE_URL = f'{"https" if DEVICE_USE_HTTPS else "http"}://{DEVICE_HOST}:{DEVICE_PORT}'
 
-routes = web.RouteTableDef()
+app = Flask(__name__)
 
-# ========== RESTful API Proxy ==========
-
-async def get_auth_header(request):
+def proxy_headers():
+    headers = {}
     auth = request.headers.get("Authorization")
     if auth:
-        return {"Authorization": auth}
-    return {}
+        headers["Authorization"] = auth
+    headers["Content-Type"] = request.headers.get("Content-Type", "application/json")
+    return headers
 
-@routes.post("/session/login")
-async def session_login(request):
-    data = await request.json()
-    async with ClientSession() as session:
-        async with session.post(f"{DEVICE_BASE_URL}/session/login", json=data) as resp:
-            result = await resp.read()
-            return web.Response(body=result, status=resp.status, content_type=resp.headers.get("Content-Type"))
+def require_auth(f):
+    @wraps(f)
+    def decorated(*args, **kwargs):
+        # All endpoints except login require an Authorization header
+        if request.path != "/session/login":
+            if not request.headers.get("Authorization"):
+                return jsonify({"error": "Authorization header required"}), 401
+        return f(*args, **kwargs)
+    return decorated
 
-@routes.post("/session/logout")
-async def session_logout(request):
-    headers = await get_auth_header(request)
-    async with ClientSession() as session:
-        async with session.post(f"{DEVICE_BASE_URL}/session/logout", headers=headers) as resp:
-            result = await resp.read()
-            return web.Response(body=result, status=resp.status, content_type=resp.headers.get("Content-Type"))
+@app.route("/session/login", methods=["POST"])
+def session_login():
+    url = f"{DEVICE_BASE_URL}/session/login"
+    data = request.get_json(force=True)
+    resp = requests.post(url, json=data, headers=proxy_headers())
+    return Response(resp.content, status=resp.status_code, content_type=resp.headers.get("Content-Type", "application/json"))
 
-@routes.get("/schedules")
-async def get_schedules(request):
-    headers = await get_auth_header(request)
-    async with ClientSession() as session:
-        async with session.get(f"{DEVICE_BASE_URL}/schedules", headers=headers) as resp:
-            result = await resp.read()
-            return web.Response(body=result, status=resp.status, content_type=resp.headers.get("Content-Type"))
+@app.route("/session/logout", methods=["POST"])
+@require_auth
+def session_logout():
+    url = f"{DEVICE_BASE_URL}/session/logout"
+    resp = requests.post(url, headers=proxy_headers())
+    return Response(resp.content, status=resp.status_code, content_type=resp.headers.get("Content-Type", "application/json"))
 
-@routes.post("/schedules")
-async def post_schedules(request):
-    headers = await get_auth_header(request)
-    data = await request.json()
-    async with ClientSession() as session:
-        async with session.post(f"{DEVICE_BASE_URL}/schedules", headers=headers, json=data) as resp:
-            result = await resp.read()
-            return web.Response(body=result, status=resp.status, content_type=resp.headers.get("Content-Type"))
+@app.route("/schedules", methods=["GET", "POST"])
+@require_auth
+def schedules():
+    url = f"{DEVICE_BASE_URL}/schedules"
+    if request.method == "GET":
+        resp = requests.get(url, headers=proxy_headers())
+        return Response(resp.content, status=resp.status_code, content_type=resp.headers.get("Content-Type", "application/json"))
+    elif request.method == "POST":
+        data = request.get_json(force=True)
+        resp = requests.post(url, json=data, headers=proxy_headers())
+        return Response(resp.content, status=resp.status_code, content_type=resp.headers.get("Content-Type", "application/json"))
 
-@routes.get("/posts")
-async def get_posts(request):
-    headers = await get_auth_header(request)
-    params = request.rel_url.query
+@app.route("/posts", methods=["GET", "POST"])
+@require_auth
+def posts():
     url = f"{DEVICE_BASE_URL}/posts"
-    if params:
-        url += "?" + urlencode(params)
-    async with ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            result = await resp.read()
-            return web.Response(body=result, status=resp.status, content_type=resp.headers.get("Content-Type"))
+    if request.method == "GET":
+        # Forward query string if present
+        qs = request.query_string.decode()
+        full_url = f"{url}?{qs}" if qs else url
+        resp = requests.get(full_url, headers=proxy_headers())
+        return Response(resp.content, status=resp.status_code, content_type=resp.headers.get("Content-Type", "application/json"))
+    elif request.method == "POST":
+        data = request.get_json(force=True)
+        resp = requests.post(url, json=data, headers=proxy_headers())
+        return Response(resp.content, status=resp.status_code, content_type=resp.headers.get("Content-Type", "application/json"))
 
-@routes.post("/posts")
-async def post_posts(request):
-    headers = await get_auth_header(request)
-    data = await request.json()
-    async with ClientSession() as session:
-        async with session.post(f"{DEVICE_BASE_URL}/posts", headers=headers, json=data) as resp:
-            result = await resp.read()
-            return web.Response(body=result, status=resp.status, content_type=resp.headers.get("Content-Type"))
-
-@routes.get("/search")
-async def search(request):
-    headers = await get_auth_header(request)
-    params = request.rel_url.query
+@app.route("/search", methods=["GET"])
+@require_auth
+def search():
     url = f"{DEVICE_BASE_URL}/search"
-    if params:
-        url += "?" + urlencode(params)
-    async with ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            result = await resp.read()
-            return web.Response(body=result, status=resp.status, content_type=resp.headers.get("Content-Type"))
+    qs = request.query_string.decode()
+    full_url = f"{url}?{qs}" if qs else url
+    resp = requests.get(full_url, headers=proxy_headers())
+    return Response(resp.content, status=resp.status_code, content_type=resp.headers.get("Content-Type", "application/json"))
 
-@routes.get("/chats/{chatId}/messages")
-async def get_chat_messages(request):
-    headers = await get_auth_header(request)
-    chat_id = request.match_info["chatId"]
-    url = f"{DEVICE_BASE_URL}/chats/{chat_id}/messages"
-    async with ClientSession() as session:
-        async with session.get(url, headers=headers) as resp:
-            result = await resp.read()
-            return web.Response(body=result, status=resp.status, content_type=resp.headers.get("Content-Type"))
-
-@routes.post("/chats/{chatId}/messages")
-async def post_chat_messages(request):
-    headers = await get_auth_header(request)
-    chat_id = request.match_info["chatId"]
-    data = await request.json()
-    url = f"{DEVICE_BASE_URL}/chats/{chat_id}/messages"
-    async with ClientSession() as session:
-        async with session.post(url, headers=headers, json=data) as resp:
-            result = await resp.read()
-            return web.Response(body=result, status=resp.status, content_type=resp.headers.get("Content-Type"))
-
-# ========== WebSocket Proxy ==========
-
-@routes.get("/wsproxy/{tail:.*}")
-async def websocket_proxy(request):
-    # ws://localhost:8000/wsproxy/ws/chat/123
-    ws_server = web.WebSocketResponse()
-    await ws_server.prepare(request)
-
-    tail = request.match_info["tail"]
-    params = request.rel_url.query
-    remote_path = f"/{tail}"
-    if params:
-        remote_url = f"{DEVICE_API_PROTO}://{DEVICE_API_HOST}:{DEVICE_API_PORT}{remote_path}?{urlencode(params)}"
-    else:
-        remote_url = f"{DEVICE_API_PROTO}://{DEVICE_API_HOST}:{DEVICE_API_PORT}{remote_path}"
-
-    headers = await get_auth_header(request)
-    async with ClientSession() as session:
-        try:
-            ws_client: ClientWebSocketResponse = await session.ws_connect(remote_url, headers=headers)
-        except Exception as e:
-            await ws_server.send_str(json.dumps({"error": str(e)}))
-            await ws_server.close()
-            return ws_server
-
-        async def ws_forward(ws_from, ws_to):
-            async for msg in ws_from:
-                if msg.type == WSMsgType.TEXT:
-                    await ws_to.send_str(msg.data)
-                elif msg.type == WSMsgType.BINARY:
-                    await ws_to.send_bytes(msg.data)
-                elif msg.type == WSMsgType.CLOSE:
-                    await ws_to.close()
-                    break
-
-        await asyncio.gather(
-            ws_forward(ws_server, ws_client),
-            ws_forward(ws_client, ws_server),
-        )
-        return ws_server
-
-# ========== App Setup ==========
-
-app = web.Application()
-app.add_routes(routes)
+@app.route("/chats/<chatId>/messages", methods=["GET", "POST"])
+@require_auth
+def chat_messages(chatId):
+    url = f"{DEVICE_BASE_URL}/chats/{chatId}/messages"
+    if request.method == "GET":
+        resp = requests.get(url, headers=proxy_headers())
+        return Response(resp.content, status=resp.status_code, content_type=resp.headers.get("Content-Type", "application/json"))
+    elif request.method == "POST":
+        data = request.get_json(force=True)
+        resp = requests.post(url, json=data, headers=proxy_headers())
+        return Response(resp.content, status=resp.status_code, content_type=resp.headers.get("Content-Type", "application/json"))
 
 if __name__ == "__main__":
-    web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
+    app.run(host=SERVER_HOST, port=SERVER_PORT)
