@@ -1,76 +1,51 @@
 import os
-import asyncio
-import aiohttp
+import io
 import threading
+import queue
 import cv2
-import numpy as np
-from aiohttp import web
+from flask import Flask, Response, stream_with_context
 
-# Environment variables
-CAMERA_IP = os.environ.get('CAMERA_IP', '192.168.1.64')
-CAMERA_RTSP_PORT = int(os.environ.get('CAMERA_RTSP_PORT', '554'))
-CAMERA_USERNAME = os.environ.get('CAMERA_USERNAME', 'admin')
-CAMERA_PASSWORD = os.environ.get('CAMERA_PASSWORD', '12345')
+# Configuration from environment variables
+DEVICE_IP = os.environ.get('DEVICE_IP')
+DEVICE_RTSP_PORT = int(os.environ.get('DEVICE_RTSP_PORT', '554'))
+DEVICE_USERNAME = os.environ.get('DEVICE_USERNAME')
+DEVICE_PASSWORD = os.environ.get('DEVICE_PASSWORD')
+RTSP_PATH = os.environ.get('DEVICE_RTSP_PATH', 'Streaming/Channels/101')
 SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
 SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
 
-RTSP_PATH = os.environ.get('CAMERA_RTSP_PATH', 'Streaming/Channels/101')
-RTSP_URL = f"rtsp://{CAMERA_USERNAME}:{CAMERA_PASSWORD}@{CAMERA_IP}:{CAMERA_RTSP_PORT}/{RTSP_PATH}"
+if not DEVICE_IP or not DEVICE_USERNAME or not DEVICE_PASSWORD:
+    raise EnvironmentError("DEVICE_IP, DEVICE_USERNAME, and DEVICE_PASSWORD must be set in environment variables.")
 
-# Shared frame buffer for MJPEG streaming
-frame_lock = threading.Lock()
-latest_frame = None
-stop_event = threading.Event()
+RTSP_URL = f"rtsp://{DEVICE_USERNAME}:{DEVICE_PASSWORD}@{DEVICE_IP}:{DEVICE_RTSP_PORT}/{RTSP_PATH}"
 
-def capture_frames():
-    global latest_frame
+app = Flask(__name__)
+
+def mjpeg_frame_generator():
     cap = cv2.VideoCapture(RTSP_URL)
-    while not stop_event.is_set():
-        ret, frame = cap.read()
-        if not ret:
-            continue
-        with frame_lock:
-            latest_frame = frame
-    cap.release()
+    if not cap.isOpened():
+        raise RuntimeError("Unable to connect to the RTSP stream")
 
-async def mjpeg_stream(request):
-    boundary = 'frame'
-    headers = {
-        'Content-Type': f'multipart/x-mixed-replace; boundary={boundary}'
-    }
-    response = web.StreamResponse(status=200, reason='OK', headers=headers)
-    await response.prepare(request)
-    while True:
-        await asyncio.sleep(0.03)  # ~30fps
-        with frame_lock:
-            frame = latest_frame.copy() if latest_frame is not None else None
-        if frame is None:
-            continue
-        ret, jpeg = cv2.imencode('.jpg', frame)
-        if not ret:
-            continue
-        data = jpeg.tobytes()
-        await response.write(
-            b"--" + boundary.encode() + b"\r\n"
-            b"Content-Type: image/jpeg\r\n"
-            b"Content-Length: " + f"{len(data)}".encode() + b"\r\n"
-            b"\r\n" + data + b"\r\n"
-        )
-    return response
+    try:
+        while True:
+            ret, frame = cap.read()
+            if not ret:
+                continue
+            ret, jpeg = cv2.imencode('.jpg', frame)
+            if not ret:
+                continue
+            frame_bytes = jpeg.tobytes()
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+    finally:
+        cap.release()
 
-async def on_startup(app):
-    t = threading.Thread(target=capture_frames, daemon=True)
-    t.start()
-    app['capture_thread'] = t
-
-async def on_cleanup(app):
-    stop_event.set()
-    app['capture_thread'].join()
-
-app = web.Application()
-app.router.add_get('/stream', mjpeg_stream)
-app.on_startup.append(on_startup)
-app.on_cleanup.append(on_cleanup)
+@app.route('/stream', methods=['GET'])
+def stream():
+    return Response(
+        stream_with_context(mjpeg_frame_generator()),
+        mimetype='multipart/x-mixed-replace; boundary=frame'
+    )
 
 if __name__ == '__main__':
-    web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
+    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
