@@ -1,51 +1,98 @@
 import os
-import io
-import threading
-import queue
+import asyncio
+import aiohttp
+from aiohttp import web
 import cv2
-from flask import Flask, Response, stream_with_context
+import numpy as np
+import base64
 
-# Configuration from environment variables
-DEVICE_IP = os.environ.get('DEVICE_IP')
-DEVICE_RTSP_PORT = int(os.environ.get('DEVICE_RTSP_PORT', '554'))
-DEVICE_USERNAME = os.environ.get('DEVICE_USERNAME')
-DEVICE_PASSWORD = os.environ.get('DEVICE_PASSWORD')
-RTSP_PATH = os.environ.get('DEVICE_RTSP_PATH', 'Streaming/Channels/101')
-SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
+# Config from environment variables
+DEVICE_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
+RTSP_PORT = int(os.environ.get("RTSP_PORT", "554"))
+RTSP_USERNAME = os.environ.get("RTSP_USERNAME", "admin")
+RTSP_PASSWORD = os.environ.get("RTSP_PASSWORD", "admin")
+RTSP_PATH = os.environ.get("RTSP_PATH", "Streaming/Channels/101")
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
 
-if not DEVICE_IP or not DEVICE_USERNAME or not DEVICE_PASSWORD:
-    raise EnvironmentError("DEVICE_IP, DEVICE_USERNAME, and DEVICE_PASSWORD must be set in environment variables.")
+RTSP_URL = f"rtsp://{RTSP_USERNAME}:{RTSP_PASSWORD}@{DEVICE_IP}:{RTSP_PORT}/{RTSP_PATH}"
 
-RTSP_URL = f"rtsp://{DEVICE_USERNAME}:{DEVICE_PASSWORD}@{DEVICE_IP}:{DEVICE_RTSP_PORT}/{RTSP_PATH}"
+# HTML page for browser viewing
+HTML_PAGE = """
+<html>
+<head>
+    <title>Hikvision Camera Stream</title>
+</head>
+<body>
+    <h2>Hikvision Camera Live Stream (MJPEG over HTTP)</h2>
+    <img src="/stream" width="720" />
+</body>
+</html>
+"""
 
-app = Flask(__name__)
+async def mjpeg_stream(request):
+    boundary = "frame"
+    response = web.StreamResponse(
+        status=200,
+        reason='OK',
+        headers={
+            'Content-Type': f'multipart/x-mixed-replace; boundary=--{boundary}',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+        }
+    )
+    await response.prepare(request)
 
-def mjpeg_frame_generator():
-    cap = cv2.VideoCapture(RTSP_URL)
+    # OpenCV VideoCapture needs to run in a thread, not event loop
+    loop = asyncio.get_event_loop()
+
+    def get_video_capture():
+        return cv2.VideoCapture(RTSP_URL)
+
+    cap = await loop.run_in_executor(None, get_video_capture)
+
     if not cap.isOpened():
-        raise RuntimeError("Unable to connect to the RTSP stream")
+        await response.write(b"--frame\r\nContent-Type: text/plain\r\n\r\nUnable to connect to camera\r\n")
+        await response.write_eof()
+        return response
 
     try:
         while True:
-            ret, frame = cap.read()
-            if not ret:
+            ret, frame = await loop.run_in_executor(None, cap.read)
+            if not ret or frame is None:
+                await asyncio.sleep(0.1)
                 continue
+            # Encode frame as JPEG
             ret, jpeg = cv2.imencode('.jpg', frame)
             if not ret:
                 continue
-            frame_bytes = jpeg.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+            data = jpeg.tobytes()
+            part = (
+                f"--{boundary}\r\n"
+                "Content-Type: image/jpeg\r\n"
+                f"Content-Length: {len(data)}\r\n"
+                "\r\n"
+            ).encode('utf-8') + data + b"\r\n"
+            try:
+                await response.write(part)
+                await response.drain()
+            except (ConnectionResetError, asyncio.CancelledError):
+                break
+            await asyncio.sleep(0.03)  # ~30fps
     finally:
-        cap.release()
+        try:
+            cap.release()
+        except Exception:
+            pass
+        await response.write_eof()
+    return response
 
-@app.route('/stream', methods=['GET'])
-def stream():
-    return Response(
-        stream_with_context(mjpeg_frame_generator()),
-        mimetype='multipart/x-mixed-replace; boundary=frame'
-    )
+async def index(request):
+    return web.Response(text=HTML_PAGE, content_type='text/html')
+
+app = web.Application()
+app.router.add_get('/', index)
+app.router.add_get('/stream', mjpeg_stream)
 
 if __name__ == '__main__':
-    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
+    web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
