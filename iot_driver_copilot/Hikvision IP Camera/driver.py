@@ -1,95 +1,76 @@
 import os
+import asyncio
+import aiohttp
 import threading
-import queue
-import time
 import cv2
-from flask import Flask, Response, abort
+import numpy as np
+from aiohttp import web
 
-# Load environment variables
-DEVICE_IP = os.environ.get('DEVICE_IP')
-RTSP_PORT = os.environ.get('RTSP_PORT', '554')
-RTSP_USERNAME = os.environ.get('RTSP_USERNAME', '')
-RTSP_PASSWORD = os.environ.get('RTSP_PASSWORD', '')
-RTSP_PATH = os.environ.get('RTSP_PATH', 'Streaming/Channels/101')
+# Environment variables
+CAMERA_IP = os.environ.get('CAMERA_IP', '192.168.1.64')
+CAMERA_RTSP_PORT = int(os.environ.get('CAMERA_RTSP_PORT', '554'))
+CAMERA_USERNAME = os.environ.get('CAMERA_USERNAME', 'admin')
+CAMERA_PASSWORD = os.environ.get('CAMERA_PASSWORD', '12345')
 SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
 SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
 
-if not DEVICE_IP:
-    raise ValueError("DEVICE_IP environment variable is required.")
+RTSP_PATH = os.environ.get('CAMERA_RTSP_PATH', 'Streaming/Channels/101')
+RTSP_URL = f"rtsp://{CAMERA_USERNAME}:{CAMERA_PASSWORD}@{CAMERA_IP}:{CAMERA_RTSP_PORT}/{RTSP_PATH}"
 
-# Construct RTSP URL
-if RTSP_USERNAME and RTSP_PASSWORD:
-    RTSP_URL = f'rtsp://{RTSP_USERNAME}:{RTSP_PASSWORD}@{DEVICE_IP}:{RTSP_PORT}/{RTSP_PATH}'
-else:
-    RTSP_URL = f'rtsp://{DEVICE_IP}:{RTSP_PORT}/{RTSP_PATH}'
+# Shared frame buffer for MJPEG streaming
+frame_lock = threading.Lock()
+latest_frame = None
+stop_event = threading.Event()
 
-app = Flask(__name__)
-
-class FrameBuffer:
-    def __init__(self, maxsize=100):
-        self.q = queue.Queue(maxsize)
-        self.last_frame = None
-
-    def put(self, frame):
-        try:
-            self.q.put_nowait(frame)
-            self.last_frame = frame
-        except queue.Full:
-            # Drop the oldest frame and put the new one
-            try:
-                self.q.get_nowait()
-            except queue.Empty:
-                pass
-            self.q.put_nowait(frame)
-            self.last_frame = frame
-
-    def get(self):
-        try:
-            return self.q.get(timeout=1)
-        except queue.Empty:
-            return self.last_frame
-
-frame_buffer = FrameBuffer()
-
-def rtsp_reader(rtsp_url, frame_buffer):
-    cap = None
-    while True:
-        if cap is None or not cap.isOpened():
-            cap = cv2.VideoCapture(rtsp_url)
-        if not cap.isOpened():
-            time.sleep(1)
-            continue
+def capture_frames():
+    global latest_frame
+    cap = cv2.VideoCapture(RTSP_URL)
+    while not stop_event.is_set():
         ret, frame = cap.read()
         if not ret:
-            time.sleep(0.1)
             continue
-        # Encode frame as JPEG
-        ret, jpeg = cv2.imencode('.jpg', frame)
-        if ret:
-            frame_buffer.put(jpeg.tobytes())
-        else:
-            time.sleep(0.01)
-    if cap is not None:
-        cap.release()
+        with frame_lock:
+            latest_frame = frame
+    cap.release()
 
-def generate_frames(frame_buffer):
+async def mjpeg_stream(request):
+    boundary = 'frame'
+    headers = {
+        'Content-Type': f'multipart/x-mixed-replace; boundary={boundary}'
+    }
+    response = web.StreamResponse(status=200, reason='OK', headers=headers)
+    await response.prepare(request)
     while True:
-        frame = frame_buffer.get()
+        await asyncio.sleep(0.03)  # ~30fps
+        with frame_lock:
+            frame = latest_frame.copy() if latest_frame is not None else None
         if frame is None:
-            time.sleep(0.01)
             continue
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        ret, jpeg = cv2.imencode('.jpg', frame)
+        if not ret:
+            continue
+        data = jpeg.tobytes()
+        await response.write(
+            b"--" + boundary.encode() + b"\r\n"
+            b"Content-Type: image/jpeg\r\n"
+            b"Content-Length: " + f"{len(data)}".encode() + b"\r\n"
+            b"\r\n" + data + b"\r\n"
+        )
+    return response
 
-@app.route('/stream', methods=['GET'])
-def stream():
-    return Response(generate_frames(frame_buffer),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
-
-def start_rtsp_thread():
-    t = threading.Thread(target=rtsp_reader, args=(RTSP_URL, frame_buffer), daemon=True)
+async def on_startup(app):
+    t = threading.Thread(target=capture_frames, daemon=True)
     t.start()
+    app['capture_thread'] = t
 
-if __name__ == "__main__":
-    start_rtsp_thread()
-    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
+async def on_cleanup(app):
+    stop_event.set()
+    app['capture_thread'].join()
+
+app = web.Application()
+app.router.add_get('/stream', mjpeg_stream)
+app.on_startup.append(on_startup)
+app.on_cleanup.append(on_cleanup)
+
+if __name__ == '__main__':
+    web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
