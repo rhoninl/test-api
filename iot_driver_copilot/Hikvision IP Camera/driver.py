@@ -1,98 +1,90 @@
 import os
-import asyncio
-import aiohttp
-from aiohttp import web
+import threading
+import time
+from flask import Flask, Response, jsonify, request
 import cv2
-import numpy as np
-import base64
 
-# Config from environment variables
-DEVICE_IP = os.environ.get("DEVICE_IP", "127.0.0.1")
-RTSP_PORT = int(os.environ.get("RTSP_PORT", "554"))
-RTSP_USERNAME = os.environ.get("RTSP_USERNAME", "admin")
-RTSP_PASSWORD = os.environ.get("RTSP_PASSWORD", "admin")
-RTSP_PATH = os.environ.get("RTSP_PATH", "Streaming/Channels/101")
-SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
+# --- Environment Variables ---
+DEVICE_IP = os.environ.get('DEVICE_IP', '192.168.1.64')
+RTSP_PORT = int(os.environ.get('RTSP_PORT', 554))
+RTSP_USERNAME = os.environ.get('RTSP_USERNAME', 'admin')
+RTSP_PASSWORD = os.environ.get('RTSP_PASSWORD', '12345')
+RTSP_PATH = os.environ.get('RTSP_PATH', 'Streaming/Channels/101')
+SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
+SERVER_PORT = int(os.environ.get('SERVER_PORT', 8080))
+STREAM_FORMAT = os.environ.get('STREAM_FORMAT', 'MJPEG')  # 'MJPEG' or 'H264'
 
-RTSP_URL = f"rtsp://{RTSP_USERNAME}:{RTSP_PASSWORD}@{DEVICE_IP}:{RTSP_PORT}/{RTSP_PATH}"
+# --- Camera Stream Control ---
+stream_active = False
+stream_lock = threading.Lock()
+cap = None
 
-# HTML page for browser viewing
-HTML_PAGE = """
-<html>
-<head>
-    <title>Hikvision Camera Stream</title>
-</head>
-<body>
-    <h2>Hikvision Camera Live Stream (MJPEG over HTTP)</h2>
-    <img src="/stream" width="720" />
-</body>
-</html>
-"""
+def get_rtsp_url():
+    return f'rtsp://{RTSP_USERNAME}:{RTSP_PASSWORD}@{DEVICE_IP}:{RTSP_PORT}/{RTSP_PATH}'
 
-async def mjpeg_stream(request):
-    boundary = "frame"
-    response = web.StreamResponse(
-        status=200,
-        reason='OK',
-        headers={
-            'Content-Type': f'multipart/x-mixed-replace; boundary=--{boundary}',
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache',
-        }
-    )
-    await response.prepare(request)
+def open_camera():
+    global cap
+    if cap is None or not cap.isOpened():
+        rtsp_url = get_rtsp_url()
+        cap = cv2.VideoCapture(rtsp_url)
+    return cap
 
-    # OpenCV VideoCapture needs to run in a thread, not event loop
-    loop = asyncio.get_event_loop()
+def close_camera():
+    global cap
+    if cap is not None:
+        cap.release()
+        cap = None
 
-    def get_video_capture():
-        return cv2.VideoCapture(RTSP_URL)
+# --- Flask App ---
+app = Flask(__name__)
 
-    cap = await loop.run_in_executor(None, get_video_capture)
+@app.route('/start', methods=['POST'])
+def start_stream():
+    global stream_active
+    with stream_lock:
+        if not stream_active:
+            open_camera()
+            stream_active = True
+        return jsonify({'status': 'streaming_started'}), 200
 
-    if not cap.isOpened():
-        await response.write(b"--frame\r\nContent-Type: text/plain\r\n\r\nUnable to connect to camera\r\n")
-        await response.write_eof()
-        return response
+@app.route('/stop', methods=['POST'])
+def stop_stream():
+    global stream_active
+    with stream_lock:
+        if stream_active:
+            stream_active = False
+            close_camera()
+        return jsonify({'status': 'streaming_stopped'}), 200
 
-    try:
-        while True:
-            ret, frame = await loop.run_in_executor(None, cap.read)
-            if not ret or frame is None:
-                await asyncio.sleep(0.1)
-                continue
-            # Encode frame as JPEG
-            ret, jpeg = cv2.imencode('.jpg', frame)
-            if not ret:
-                continue
-            data = jpeg.tobytes()
-            part = (
-                f"--{boundary}\r\n"
-                "Content-Type: image/jpeg\r\n"
-                f"Content-Length: {len(data)}\r\n"
-                "\r\n"
-            ).encode('utf-8') + data + b"\r\n"
-            try:
-                await response.write(part)
-                await response.drain()
-            except (ConnectionResetError, asyncio.CancelledError):
+def gen_mjpeg():
+    """Generator that yields MJPEG frames from the camera."""
+    global stream_active
+    while True:
+        with stream_lock:
+            if not stream_active or cap is None:
                 break
-            await asyncio.sleep(0.03)  # ~30fps
-    finally:
-        try:
-            cap.release()
-        except Exception:
-            pass
-        await response.write_eof()
-    return response
+            ret, frame = cap.read()
+        if not ret:
+            time.sleep(0.1)
+            continue
+        ret, jpeg = cv2.imencode('.jpg', frame)
+        if not ret:
+            continue
+        frame_bytes = jpeg.tobytes()
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+    # Stream ended, cleanup
+    close_camera()
 
-async def index(request):
-    return web.Response(text=HTML_PAGE, content_type='text/html')
-
-app = web.Application()
-app.router.add_get('/', index)
-app.router.add_get('/stream', mjpeg_stream)
+@app.route('/stream', methods=['GET'])
+def stream_video():
+    if STREAM_FORMAT.upper() == 'MJPEG':
+        with stream_lock:
+            if not stream_active:
+                return jsonify({'error': 'stream_not_active'}), 400
+        return Response(gen_mjpeg(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    else:
+        return jsonify({'error': 'unsupported_stream_format'}), 400
 
 if __name__ == '__main__':
-    web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
+    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
