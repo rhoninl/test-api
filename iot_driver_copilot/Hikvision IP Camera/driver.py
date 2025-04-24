@@ -1,90 +1,98 @@
 import os
 import threading
 import time
-from flask import Flask, Response, jsonify, request
+from flask import Flask, Response, request, jsonify
 import cv2
 
-# --- Environment Variables ---
-DEVICE_IP = os.environ.get('DEVICE_IP', '192.168.1.64')
-RTSP_PORT = int(os.environ.get('RTSP_PORT', 554))
-RTSP_USERNAME = os.environ.get('RTSP_USERNAME', 'admin')
-RTSP_PASSWORD = os.environ.get('RTSP_PASSWORD', '12345')
-RTSP_PATH = os.environ.get('RTSP_PATH', 'Streaming/Channels/101')
-SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.environ.get('SERVER_PORT', 8080))
-STREAM_FORMAT = os.environ.get('STREAM_FORMAT', 'MJPEG')  # 'MJPEG' or 'H264'
+# Configuration from environment variables
+DEVICE_IP = os.environ.get("DEVICE_IP")
+DEVICE_USERNAME = os.environ.get("DEVICE_USERNAME", "")
+DEVICE_PASSWORD = os.environ.get("DEVICE_PASSWORD", "")
+RTSP_PORT = int(os.environ.get("RTSP_PORT", "554"))
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
+STREAM_PATH = os.environ.get("STREAM_PATH", "/Streaming/Channels/101")
 
-# --- Camera Stream Control ---
-stream_active = False
-stream_lock = threading.Lock()
-cap = None
+RTSP_TEMPLATE = "rtsp://{username}:{password}@{ip}:{port}{path}"
 
-def get_rtsp_url():
-    return f'rtsp://{RTSP_USERNAME}:{RTSP_PASSWORD}@{DEVICE_IP}:{RTSP_PORT}/{RTSP_PATH}'
+# Global state
+stream_active = threading.Event()
+camera_lock = threading.Lock()
+video_capture = None
 
-def open_camera():
-    global cap
-    if cap is None or not cap.isOpened():
-        rtsp_url = get_rtsp_url()
-        cap = cv2.VideoCapture(rtsp_url)
-    return cap
-
-def close_camera():
-    global cap
-    if cap is not None:
-        cap.release()
-        cap = None
-
-# --- Flask App ---
 app = Flask(__name__)
 
-@app.route('/start', methods=['POST'])
+def get_rtsp_url():
+    return RTSP_TEMPLATE.format(
+        username=DEVICE_USERNAME,
+        password=DEVICE_PASSWORD,
+        ip=DEVICE_IP,
+        port=RTSP_PORT,
+        path=STREAM_PATH
+    )
+
 def start_stream():
-    global stream_active
-    with stream_lock:
-        if not stream_active:
-            open_camera()
-            stream_active = True
-        return jsonify({'status': 'streaming_started'}), 200
+    global video_capture
+    with camera_lock:
+        if stream_active.is_set():
+            return
+        rtsp_url = get_rtsp_url()
+        video_capture = cv2.VideoCapture(rtsp_url)
+        if video_capture.isOpened():
+            stream_active.set()
+        else:
+            video_capture.release()
+            video_capture = None
 
-@app.route('/stop', methods=['POST'])
 def stop_stream():
-    global stream_active
-    with stream_lock:
-        if stream_active:
-            stream_active = False
-            close_camera()
-        return jsonify({'status': 'streaming_stopped'}), 200
+    global video_capture
+    with camera_lock:
+        stream_active.clear()
+        if video_capture is not None:
+            video_capture.release()
+            video_capture = None
 
-def gen_mjpeg():
-    """Generator that yields MJPEG frames from the camera."""
-    global stream_active
-    while True:
-        with stream_lock:
-            if not stream_active or cap is None:
+def gen_frames():
+    global video_capture
+    while stream_active.is_set():
+        with camera_lock:
+            if video_capture is None:
                 break
-            ret, frame = cap.read()
+            ret, frame = video_capture.read()
         if not ret:
             time.sleep(0.1)
             continue
-        ret, jpeg = cv2.imencode('.jpg', frame)
+        ret, buffer = cv2.imencode('.jpg', frame)
         if not ret:
             continue
-        frame_bytes = jpeg.tobytes()
+        frame_bytes = buffer.tobytes()
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-    # Stream ended, cleanup
-    close_camera()
+    # Stream stopped, send end of stream
+    yield b''
+
+@app.route('/start', methods=['POST'])
+def api_start():
+    if stream_active.is_set():
+        return jsonify({"status": "already_started"}), 200
+    start_stream()
+    if stream_active.is_set():
+        return jsonify({"status": "started"}), 200
+    else:
+        return jsonify({"status": "failed_to_start"}), 500
+
+@app.route('/stop', methods=['POST'])
+def api_stop():
+    if not stream_active.is_set():
+        return jsonify({"status": "already_stopped"}), 200
+    stop_stream()
+    return jsonify({"status": "stopped"}), 200
 
 @app.route('/stream', methods=['GET'])
-def stream_video():
-    if STREAM_FORMAT.upper() == 'MJPEG':
-        with stream_lock:
-            if not stream_active:
-                return jsonify({'error': 'stream_not_active'}), 400
-        return Response(gen_mjpeg(), mimetype='multipart/x-mixed-replace; boundary=frame')
-    else:
-        return jsonify({'error': 'unsupported_stream_format'}), 400
+def api_stream():
+    if not stream_active.is_set():
+        return jsonify({"error": "stream_not_started"}), 400
+    return Response(gen_frames(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
 if __name__ == '__main__':
     app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
