@@ -2,92 +2,105 @@ import os
 import threading
 import queue
 import time
-from flask import Flask, Response, request, abort
+import io
+
+from flask import Flask, Response, request, jsonify
 
 import cv2
 
+# Configuration from environment variables
+CAMERA_IP = os.environ.get('CAMERA_IP')
+CAMERA_RTSP_PORT = os.environ.get('CAMERA_RTSP_PORT', '554')
+CAMERA_USER = os.environ.get('CAMERA_USER', 'admin')
+CAMERA_PASSWORD = os.environ.get('CAMERA_PASSWORD', '12345')
+CAMERA_CHANNEL = os.environ.get('CAMERA_CHANNEL', '101')
+RTSP_PATH = os.environ.get('CAMERA_RTSP_PATH', f'/Streaming/Channels/{CAMERA_CHANNEL}')
+RTSP_TRANSPORT = os.environ.get('CAMERA_RTSP_TRANSPORT', 'tcp')
+SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
+SERVER_PORT = int(os.environ.get('SERVER_PORT', 8080))
+
+# RTSP URL construction
+RTSP_URL = f"rtsp://{CAMERA_USER}:{CAMERA_PASSWORD}@{CAMERA_IP}:{CAMERA_RTSP_PORT}{RTSP_PATH}"
+
 app = Flask(__name__)
 
-DEVICE_IP = os.environ.get("DEVICE_IP", "192.168.1.64")
-DEVICE_STREAM_PORT = int(os.environ.get("DEVICE_STREAM_PORT", "554"))
-DEVICE_USERNAME = os.environ.get("DEVICE_USERNAME", "admin")
-DEVICE_PASSWORD = os.environ.get("DEVICE_PASSWORD", "12345")
-SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "8000"))
-RTSP_PATH = os.environ.get("RTSP_PATH", "/Streaming/Channels/101")
-RTSP_PROTOCOL = os.environ.get("RTSP_PROTOCOL", "rtsp")
-
-STREAM_URI = f"{RTSP_PROTOCOL}://{DEVICE_USERNAME}:{DEVICE_PASSWORD}@{DEVICE_IP}:{DEVICE_STREAM_PORT}{RTSP_PATH}"
-
-streaming_thread = None
-frame_queue = queue.Queue(maxsize=10)
-streaming_active = threading.Event()
-thread_lock = threading.Lock()
+# Control state and stream
+streaming_event = threading.Event()
+frame_queue = queue.Queue(maxsize=100)
+stream_thread = None
 
 def stream_worker():
     cap = None
     try:
-        cap = cv2.VideoCapture(STREAM_URI)
+        cap = cv2.VideoCapture(RTSP_URL, cv2.CAP_FFMPEG)
         if not cap.isOpened():
-            streaming_active.clear()
-            return
-        while streaming_active.is_set():
+            raise RuntimeError("Failed to connect to camera stream.")
+        while streaming_event.is_set():
             ret, frame = cap.read()
             if not ret:
-                break
+                continue
+            # Encode as JPEG
             ret, jpeg = cv2.imencode('.jpg', frame)
             if not ret:
                 continue
+            # Put into queue, drop oldest if full
             try:
-                if frame_queue.full():
-                    frame_queue.get_nowait()
-                frame_queue.put_nowait(jpeg.tobytes())
+                frame_queue.put(jpeg.tobytes(), timeout=0.2)
             except queue.Full:
-                continue
-            time.sleep(0.03)
+                try:
+                    frame_queue.get_nowait()
+                    frame_queue.put(jpeg.tobytes(), timeout=0.2)
+                except queue.Empty:
+                    pass
     finally:
-        if cap:
+        if cap is not None:
             cap.release()
-        streaming_active.clear()
-        with frame_queue.mutex:
-            frame_queue.queue.clear()
 
-@app.route("/stream", methods=["POST"])
 def start_stream():
-    with thread_lock:
-        if streaming_active.is_set():
-            return {"status": "stream already active"}, 200
-        streaming_active.set()
-        global streaming_thread
-        streaming_thread = threading.Thread(target=stream_worker, daemon=True)
-        streaming_thread.start()
-    return {"status": "stream started"}, 200
+    global stream_thread
+    if not streaming_event.is_set():
+        streaming_event.set()
+        stream_thread = threading.Thread(target=stream_worker, daemon=True)
+        stream_thread.start()
 
-@app.route("/stream", methods=["GET"])
-def get_stream():
-    if not streaming_active.is_set():
-        abort(404, description="Stream not active. Start with POST /stream.")
-    
-    def generate():
-        while streaming_active.is_set():
-            try:
-                frame = frame_queue.get(timeout=2)
-            except queue.Empty:
-                continue
+def stop_stream():
+    streaming_event.clear()
+    # Clear frame queue
+    while not frame_queue.empty():
+        try:
+            frame_queue.get_nowait()
+        except queue.Empty:
+            break
+
+@app.route('/stream', methods=['POST'])
+def activate_stream():
+    if streaming_event.is_set():
+        return jsonify({"status": "already streaming"}), 200
+    start_stream()
+    return jsonify({"status": "stream started"}), 200
+
+def gen_mjpeg():
+    while streaming_event.is_set():
+        try:
+            frame = frame_queue.get(timeout=1)
             yield (b'--frame\r\n'
                    b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
+        except queue.Empty:
+            continue
 
-@app.route("/stream", methods=["DELETE"])
-def stop_stream():
-    with thread_lock:
-        if streaming_active.is_set():
-            streaming_active.clear()
-            if streaming_thread and streaming_thread.is_alive():
-                streaming_thread.join(timeout=2)
-            return {"status": "stream stopped"}, 200
-        else:
-            return {"status": "stream not active"}, 200
+@app.route('/stream', methods=['GET'])
+def get_stream():
+    if not streaming_event.is_set():
+        return jsonify({"error": "stream is not active. Please POST /stream to start."}), 404
+    return Response(gen_mjpeg(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
-if __name__ == "__main__":
+@app.route('/stream', methods=['DELETE'])
+def terminate_stream():
+    if not streaming_event.is_set():
+        return jsonify({"status": "stream not active"}), 200
+    stop_stream()
+    return jsonify({"status": "stream stopped"}), 200
+
+if __name__ == '__main__':
     app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
