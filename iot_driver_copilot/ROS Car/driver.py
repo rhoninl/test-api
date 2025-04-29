@@ -2,95 +2,111 @@ import os
 import asyncio
 import json
 import base64
-import aiohttp
 from aiohttp import web
+import aiohttp
 import websockets
 
-ROSBRIDGE_WS_HOST = os.environ.get("ROSBRIDGE_WS_HOST", "localhost")
-ROSBRIDGE_WS_PORT = int(os.environ.get("ROSBRIDGE_WS_PORT", "9090"))
-ROS_CAMERA_TOPIC = os.environ.get("ROS_CAMERA_TOPIC", "/camera/image/compressed")
+# Environment Variables
+ROSBRIDGE_HOST = os.environ.get("ROSBRIDGE_HOST", "localhost")
+ROSBRIDGE_PORT = int(os.environ.get("ROSBRIDGE_PORT", "9090"))
+
 HTTP_SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
 HTTP_SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", "8080"))
 
-class RosCameraStream:
-    def __init__(self, ws_host, ws_port, camera_topic):
-        self.ws_uri = f"ws://{ws_host}:{ws_port}"
-        self.camera_topic = camera_topic
-        self.latest_image = None
-        self._clients = set()
+CAMERA_IMAGE_TOPIC = os.environ.get("CAMERA_IMAGE_TOPIC", "/camera/image/compressed")
+CAMERA_IMAGE_TYPE = os.environ.get("CAMERA_IMAGE_TYPE", "sensor_msgs/CompressedImage")
+CAMERA_IMAGE_FIELD = os.environ.get("CAMERA_IMAGE_FIELD", "data")
+CAMERA_IMAGE_ENCODING = os.environ.get("CAMERA_IMAGE_ENCODING", "jpeg")  # just for content-type
+
+class ROSBridgeCameraProxy:
+    def __init__(self, host, port, topic, msg_type):
+        self._uri = f"ws://{host}:{port}"
+        self._topic = topic
+        self._msg_type = msg_type
         self._ws = None
-        self._listen_task = None
+        self._msg_queue = asyncio.Queue()
+        self._listener_task = None
 
     async def connect(self):
-        self._ws = await websockets.connect(self.ws_uri)
+        self._ws = await websockets.connect(self._uri)
         subscribe_msg = {
             "op": "subscribe",
-            "topic": self.camera_topic,
-            "type": "sensor_msgs/CompressedImage",
-            "queue_length": 1
+            "topic": self._topic,
+            "type": self._msg_type,
+            "queue_length": 1,
         }
         await self._ws.send(json.dumps(subscribe_msg))
-        self._listen_task = asyncio.create_task(self._listen())
+        if self._listener_task is None:
+            self._listener_task = asyncio.create_task(self._msg_listener())
 
-    async def _listen(self):
+    async def _msg_listener(self):
         try:
-            async for msg in self._ws:
-                msg_data = json.loads(msg)
-                if msg_data.get("op") == "publish" and "msg" in msg_data:
-                    img_data_b64 = msg_data["msg"].get("data")
-                    if img_data_b64:
-                        self.latest_image = base64.b64decode(img_data_b64)
+            async for message in self._ws:
+                msg = json.loads(message)
+                if "msg" in msg and CAMERA_IMAGE_FIELD in msg["msg"]:
+                    await self._msg_queue.put(msg["msg"][CAMERA_IMAGE_FIELD])
         except Exception:
             pass
+        finally:
+            await self._cleanup()
 
-    async def get_latest_image(self):
-        if self.latest_image is not None:
-            return self.latest_image
-        return None
+    async def get_next_image(self):
+        return await self._msg_queue.get()
 
-    async def start(self):
-        await self.connect()
+    async def _cleanup(self):
+        if self._ws:
+            await self._ws.close()
+            self._ws = None
+        if self._listener_task:
+            self._listener_task.cancel()
+            self._listener_task = None
 
-async def camera_stream(request):
-    # MJPEG HTTP stream
+    async def disconnect(self):
+        await self._cleanup()
+
+camera_proxy = ROSBridgeCameraProxy(
+    ROSBRIDGE_HOST,
+    ROSBRIDGE_PORT,
+    CAMERA_IMAGE_TOPIC,
+    CAMERA_IMAGE_TYPE,
+)
+
+async def cam_mjpeg_stream(request):
+    boundary = "frame"
     response = web.StreamResponse(
         status=200,
         reason='OK',
         headers={
-            'Content-Type': 'multipart/x-mixed-replace; boundary=frame',
+            'Content-Type': f'multipart/x-mixed-replace; boundary=--{boundary}',
             'Cache-Control': 'no-cache',
             'Connection': 'close',
-            'Pragma': 'no-cache'
         }
     )
     await response.prepare(request)
-    last_image = None
+
+    # Connect once for all clients
+    if camera_proxy._ws is None:
+        await camera_proxy.connect()
+
     try:
         while True:
-            image = await request.app["ros_camera"].get_latest_image()
-            if image is not None and image != last_image:
-                await response.write(b"--frame\r\n")
-                await response.write(b"Content-Type: image/jpeg\r\n\r\n")
-                await response.write(image)
-                await response.write(b"\r\n")
-                last_image = image
-            await asyncio.sleep(0.05)  # ~20 FPS
+            img_b64 = await camera_proxy.get_next_image()
+            img_bytes = base64.b64decode(img_b64)
+            await response.write(
+                f"--{boundary}\r\nContent-Type: image/{CAMERA_IMAGE_ENCODING}\r\nContent-Length: {len(img_bytes)}\r\n\r\n".encode('utf-8') + img_bytes + b"\r\n"
+            )
+            await response.drain()
     except asyncio.CancelledError:
         pass
     except Exception:
         pass
-    return response
+    finally:
+        return response
 
-async def on_startup(app):
-    ros_camera = RosCameraStream(ROSBRIDGE_WS_HOST, ROSBRIDGE_WS_PORT, ROS_CAMERA_TOPIC)
-    await ros_camera.start()
-    app["ros_camera"] = ros_camera
+app = web.Application()
+app.router.add_get('/cam', cam_mjpeg_stream)
 
-def main():
-    app = web.Application()
-    app.router.add_get('/cam', camera_stream)
-    app.on_startup.append(on_startup)
+if __name__ == '__main__':
+    loop = asyncio.get_event_loop()
+    loop.run_until_complete(camera_proxy.connect())
     web.run_app(app, host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT)
-
-if __name__ == "__main__":
-    main()
