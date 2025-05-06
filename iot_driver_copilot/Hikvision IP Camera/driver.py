@@ -1,113 +1,142 @@
 import os
 import threading
 import time
-import io
-from flask import Flask, Response, request, jsonify
+import queue
+import requests
+from flask import Flask, Response, request, jsonify, stream_with_context
+
 import cv2
 
 # Configuration from environment variables
-CAMERA_IP = os.environ.get("CAMERA_IP", "192.168.1.64")
-CAMERA_RTSP_PORT = int(os.environ.get("CAMERA_RTSP_PORT", "554"))
-CAMERA_USER = os.environ.get("CAMERA_USER", "admin")
-CAMERA_PASSWORD = os.environ.get("CAMERA_PASSWORD", "12345")
-RTSP_PATH = os.environ.get("RTSP_PATH", "Streaming/Channels/101")
-HTTP_SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
-HTTP_SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", "8080"))
+DEVICE_IP = os.environ.get("DEVICE_IP", "192.168.1.64")
+DEVICE_RTSP_PORT = int(os.environ.get("DEVICE_RTSP_PORT", "554"))
+DEVICE_USERNAME = os.environ.get("DEVICE_USERNAME", "admin")
+DEVICE_PASSWORD = os.environ.get("DEVICE_PASSWORD", "12345")
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
 
-# Build RTSP URL
-RTSP_URL = f"rtsp://{CAMERA_USER}:{CAMERA_PASSWORD}@{CAMERA_IP}:{CAMERA_RTSP_PORT}/{RTSP_PATH}"
+# Camera Stream Path (adjust if needed)
+RTSP_STREAM_PATH = os.environ.get(
+    "RTSP_STREAM_PATH",
+    f"/Streaming/Channels/101"
+)
 
+# MJPEG stream buffer size
+FRAME_QUEUE_SIZE = int(os.environ.get("FRAME_QUEUE_SIZE", "10"))
+
+# Flask app
 app = Flask(__name__)
 
-# Global state for streaming
-streaming_active = threading.Event()
-frame_lock = threading.Lock()
-current_frame = [None]  # Use a list to allow mutability inside threads
+# Global streaming state
+streaming_enabled = threading.Event()
+streaming_enabled.clear()
+frame_queue = queue.Queue(maxsize=FRAME_QUEUE_SIZE)
 
-def rtsp_capture_loop():
-    global current_frame
+# Thread handle
+capture_thread = None
+
+def get_rtsp_url():
+    return f"rtsp://{DEVICE_USERNAME}:{DEVICE_PASSWORD}@{DEVICE_IP}:{DEVICE_RTSP_PORT}{RTSP_STREAM_PATH}"
+
+def capture_frames():
+    rtsp_url = get_rtsp_url()
     cap = None
-    while True:
-        if streaming_active.is_set():
-            if cap is None:
-                cap = cv2.VideoCapture(RTSP_URL)
-                if not cap.isOpened():
-                    cap.release()
-                    cap = None
-                    time.sleep(1)
-                    continue
-            ret, frame = cap.read()
-            if not ret:
-                cap.release()
-                cap = None
-                time.sleep(0.5)
+    reconnect_delay = 5
+    while streaming_enabled.is_set():
+        if not cap or not cap.isOpened():
+            cap = cv2.VideoCapture(rtsp_url)
+            if not cap.isOpened():
+                time.sleep(reconnect_delay)
                 continue
-            with frame_lock:
-                current_frame[0] = frame
-            time.sleep(0.03)  # ~30 fps
-        else:
-            if cap is not None:
-                cap.release()
-                cap = None
-            with frame_lock:
-                current_frame[0] = None
-            time.sleep(0.1)
-
-# Start background thread for capturing frames
-capture_thread = threading.Thread(target=rtsp_capture_loop, daemon=True)
-capture_thread.start()
-
-@app.route('/video/start', methods=['POST'])
-def start_stream():
-    streaming_active.set()
-    return jsonify({"status": "started"}), 200
-
-@app.route('/video/stop', methods=['POST'])
-def stop_stream():
-    streaming_active.clear()
-    return jsonify({"status": "stopped"}), 200
-
-def generate_mjpeg():
-    while streaming_active.is_set():
-        with frame_lock:
-            frame = current_frame[0]
-        if frame is None:
-            time.sleep(0.05)
+        ret, frame = cap.read()
+        if not ret:
+            cap.release()
+            time.sleep(reconnect_delay)
             continue
         ret, jpeg = cv2.imencode('.jpg', frame)
-        if not ret:
+        if ret:
+            try:
+                frame_queue.put(jpeg.tobytes(), block=False)
+            except queue.Full:
+                pass  # Drop frame if queue is full
+        else:
             continue
-        frame_bytes = jpeg.tobytes()
+    if cap and cap.isOpened():
+        cap.release()
+    frame_queue.queue.clear()
+
+def start_stream():
+    global capture_thread
+    if not streaming_enabled.is_set():
+        streaming_enabled.set()
+        capture_thread = threading.Thread(target=capture_frames, daemon=True)
+        capture_thread.start()
+        return True
+    return False
+
+def stop_stream():
+    streaming_enabled.clear()
+    # Wait for thread to finish and clear frames
+    if capture_thread:
+        capture_thread.join(timeout=3)
+    frame_queue.queue.clear()
+    return True
+
+@app.route('/video/start', methods=['POST'])
+def api_start_stream():
+    if start_stream():
+        return jsonify({"status": "started"}), 200
+    else:
+        return jsonify({"status": "already running"}), 200
+
+@app.route('/video/stop', methods=['POST'])
+def api_stop_stream():
+    if streaming_enabled.is_set():
+        stop_stream()
+        return jsonify({"status": "stopped"}), 200
+    else:
+        return jsonify({"status": "already stopped"}), 200
+
+def mjpeg_generator():
+    while streaming_enabled.is_set():
+        try:
+            frame = frame_queue.get(timeout=3)
+        except queue.Empty:
+            continue
         yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-        time.sleep(0.03)  # ~30 fps
+               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+    # If streaming stops, end stream
+    yield (b'--frame\r\n'
+           b'Content-Type: text/plain\r\n\r\nStream Ended\r\n')
 
-@app.route('/video', methods=['GET'])
+@app.route('/video')
 def video_feed():
-    if not streaming_active.is_set():
-        return Response("Stream not started. POST to /video/start first.", status=503)
-    return Response(generate_mjpeg(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
+    if not streaming_enabled.is_set():
+        return jsonify({"error": "Stream is not started"}), 503
+    return Response(
+        stream_with_context(mjpeg_generator()),
+        mimetype='multipart/x-mixed-replace; boundary=frame'
+    )
 
-@app.route('/', methods=['GET'])
+@app.route('/')
 def index():
     return '''
     <html>
-        <head>
-            <title>Hikvision Camera MJPEG Stream</title>
-        </head>
-        <body>
-            <h1>Hikvision Camera MJPEG Stream</h1>
-            <img src="/video" width="720" />
-            <form method="post" action="/video/start">
-                <button type="submit">Start Stream</button>
-            </form>
-            <form method="post" action="/video/stop">
-                <button type="submit">Stop Stream</button>
-            </form>
-        </body>
+    <head>
+        <title>Hikvision IP Camera Stream</title>
+    </head>
+    <body>
+        <h1>Hikvision Camera Live Stream</h1>
+        <img src="/video" width="640" />
+        <form method="post" action="/video/start">
+            <button type="submit">Start Stream</button>
+        </form>
+        <form method="post" action="/video/stop">
+            <button type="submit">Stop Stream</button>
+        </form>
+    </body>
     </html>
     '''
 
 if __name__ == '__main__':
-    app.run(host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT, threaded=True)
+    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
