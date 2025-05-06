@@ -1,159 +1,139 @@
 import os
-import io
 import threading
-import time
 import queue
-import base64
-from flask import Flask, Response, request, send_file, jsonify
+import time
 import requests
+from flask import Flask, Response, request, jsonify, send_file, abort
 import cv2
 import numpy as np
 
-# Configuration from environment variables
-CAMERA_HOST = os.environ.get("HIKVISION_HOST", "192.168.1.64")
-CAMERA_RTSP_PORT = int(os.environ.get("HIKVISION_RTSP_PORT", "554"))
-CAMERA_HTTP_PORT = int(os.environ.get("HIKVISION_HTTP_PORT", "80"))
-CAMERA_USER = os.environ.get("HIKVISION_USER", "admin")
-CAMERA_PASS = os.environ.get("HIKVISION_PASS", "12345")
-SERVER_HOST = os.environ.get("DRIVER_HTTP_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("DRIVER_HTTP_PORT", "8080"))
-STREAM_PATH = os.environ.get("HIKVISION_STREAM_PATH", "Streaming/Channels/101")
-SNAPSHOT_PATH = os.environ.get("HIKVISION_SNAPSHOT_PATH", "Streaming/channels/1/picture")
-RTSP_STREAM_URL = f"rtsp://{CAMERA_USER}:{CAMERA_PASS}@{CAMERA_HOST}:{CAMERA_RTSP_PORT}/{STREAM_PATH}"
+# Configuration via environment variables
+DEVICE_IP = os.environ.get('DEVICE_IP', '192.168.1.64')
+RTSP_PORT = int(os.environ.get('RTSP_PORT', '554'))
+RTSP_USER = os.environ.get('DEVICE_USER', 'admin')
+RTSP_PASS = os.environ.get('DEVICE_PASS', '12345')
+SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
+SERVER_PORT = int(os.environ.get('SERVER_PORT', '8000'))
+SNAPSHOT_PORT = int(os.environ.get('SNAPSHOT_PORT', '80'))
 
+RTSP_STREAM_PATH = os.environ.get('RTSP_STREAM_PATH', '/Streaming/Channels/101')
+SNAPSHOT_PATH = os.environ.get('SNAPSHOT_PATH', '/ISAPI/Streaming/channels/101/picture')
+
+# RTSP URL construction
+RTSP_URL = f"rtsp://{RTSP_USER}:{RTSP_PASS}@{DEVICE_IP}:{RTSP_PORT}{RTSP_STREAM_PATH}"
+
+# Snapshot URL construction
+SNAPSHOT_URL = f"http://{DEVICE_IP}:{SNAPSHOT_PORT}{SNAPSHOT_PATH}"
+
+# Flask App
 app = Flask(__name__)
 
-# Global variables for session management
-stream_active = threading.Event()
-stream_queue = queue.Queue(maxsize=100)
-capture_thread = None
+# Streaming session management
+streaming_state = {
+    "is_streaming": False,
+    "clients": 0,
+    "capture_thread": None,
+    "frame_queue": queue.Queue(maxsize=10),
+    "stop_event": threading.Event()
+}
 
-def mjpeg_generator():
-    while stream_active.is_set():
-        try:
-            frame = stream_queue.get(timeout=2)
-            if frame is None:
-                break
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-        except queue.Empty:
-            break
-
-def h264_generator():
-    while stream_active.is_set():
-        try:
-            data = stream_queue.get(timeout=2)
-            if data is None:
-                break
-            yield data
-        except queue.Empty:
-            break
-
-def stream_capture_worker():
-    cap = cv2.VideoCapture(RTSP_STREAM_URL)
+def rtsp_capture_worker():
+    streaming_state['is_streaming'] = True
+    cap = cv2.VideoCapture(RTSP_URL)
     if not cap.isOpened():
+        streaming_state['is_streaming'] = False
         return
-    while stream_active.is_set():
+    while not streaming_state['stop_event'].is_set():
         ret, frame = cap.read()
         if not ret:
-            time.sleep(0.2)
-            continue
-        # For MJPEG streaming (/video), encode frame as JPEG
-        ret2, jpeg = cv2.imencode('.jpg', frame)
-        if ret2:
-            # Only keep newest frames in the queue
-            try:
-                stream_queue.get_nowait()
-            except queue.Empty:
-                pass
-            stream_queue.put(jpeg.tobytes())
-    cap.release()
-    # Signal generator to end
-    stream_queue.put(None)
-
-def h264_stream_worker():
-    cap = cv2.VideoCapture(RTSP_STREAM_URL)
-    if not cap.isOpened():
-        return
-    while stream_active.is_set():
-        ret, frame = cap.read()
+            break
+        # Encode frame as JPEG for browser-friendly streaming
+        ret, jpg = cv2.imencode('.jpg', frame)
         if not ret:
-            time.sleep(0.2)
             continue
-        # Encode frame as H264
-        ret2, h264 = cv2.imencode('.h264', frame)
-        if ret2:
-            try:
-                stream_queue.get_nowait()
-            except queue.Empty:
-                pass
-            stream_queue.put(h264.tobytes())
+        try:
+            if streaming_state['frame_queue'].full():
+                try:
+                    streaming_state['frame_queue'].get_nowait()
+                except queue.Empty:
+                    pass
+            streaming_state['frame_queue'].put(jpg.tobytes())
+        except Exception:
+            break
     cap.release()
-    stream_queue.put(None)
+    streaming_state['is_streaming'] = False
 
 def start_stream():
-    global capture_thread
-    if stream_active.is_set():
-        return
-    while not stream_queue.empty():
-        try:
-            stream_queue.get_nowait()
-        except queue.Empty:
-            break
-    stream_active.set()
-    capture_thread = threading.Thread(target=stream_capture_worker, daemon=True)
-    capture_thread.start()
-
-def start_h264_stream():
-    global capture_thread
-    if stream_active.is_set():
-        return
-    while not stream_queue.empty():
-        try:
-            stream_queue.get_nowait()
-        except queue.Empty:
-            break
-    stream_active.set()
-    capture_thread = threading.Thread(target=h264_stream_worker, daemon=True)
-    capture_thread.start()
+    if not streaming_state['is_streaming']:
+        streaming_state['stop_event'].clear()
+        streaming_state['capture_thread'] = threading.Thread(target=rtsp_capture_worker, daemon=True)
+        streaming_state['capture_thread'].start()
 
 def stop_stream():
-    stream_active.clear()
-    # Clean up the queue
-    while not stream_queue.empty():
-        try:
-            stream_queue.get_nowait()
-        except queue.Empty:
-            break
+    streaming_state['stop_event'].set()
+    if streaming_state['capture_thread'] and streaming_state['capture_thread'].is_alive():
+        streaming_state['capture_thread'].join()
+    streaming_state['is_streaming'] = False
+    with streaming_state['frame_queue'].mutex:
+        streaming_state['frame_queue'].queue.clear()
 
-@app.route("/play", methods=["POST"])
-def play():
+@app.route('/play', methods=['POST'])
+def play_stream():
     start_stream()
-    return jsonify({"message": "Streaming started"}), 200
+    return jsonify({
+        "status": "streaming_started",
+        "video_url": f"http://{SERVER_HOST}:{SERVER_PORT}/video"
+    })
 
-@app.route("/halt", methods=["POST"])
-def halt():
+@app.route('/halt', methods=['POST'])
+def halt_stream():
     stop_stream()
-    return jsonify({"message": "Streaming stopped"}), 200
+    return jsonify({"status": "streaming_stopped"})
 
-@app.route("/video", methods=["GET"])
-def video():
-    # Start stream if not already started
+@app.route('/video', methods=['GET'])
+def video_feed():
+    # Increment client count
+    streaming_state['clients'] += 1
     start_stream()
-    return Response(mjpeg_generator(), mimetype='multipart/x-mixed-replace; boundary=frame')
+    def generate():
+        try:
+            while not streaming_state['stop_event'].is_set():
+                try:
+                    frame = streaming_state['frame_queue'].get(timeout=2)
+                except queue.Empty:
+                    continue
+                yield (b'--frame\r\n'
+                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
+        finally:
+            streaming_state['clients'] -= 1
+            # If last client disconnects, stop stream
+            if streaming_state['clients'] <= 0:
+                stop_stream()
+    return Response(generate(), mimetype='multipart/x-mixed-replace; boundary=frame')
 
-@app.route("/snap", methods=["GET", "POST"])
-def snap():
-    # Use camera's HTTP snapshot API
-    url = f"http://{CAMERA_HOST}:{CAMERA_HTTP_PORT}/{SNAPSHOT_PATH}"
+def get_snapshot():
     try:
-        resp = requests.get(url, auth=(CAMERA_USER, CAMERA_PASS), timeout=5, stream=True)
-        if resp.status_code == 200:
-            return Response(resp.content, mimetype='image/jpeg')
-        else:
-            return jsonify({"error": "Failed to retrieve snapshot", "status": resp.status_code}), 502
-    except Exception as e:
-        return jsonify({"error": "Exception getting snapshot", "exception": str(e)}), 500
+        resp = requests.get(SNAPSHOT_URL, auth=(RTSP_USER, RTSP_PASS), timeout=5)
+        if resp.status_code == 200 and resp.headers.get('Content-Type', '').startswith('image'):
+            return resp.content
+        # Fallback: use RTSP stream and OpenCV
+        cap = cv2.VideoCapture(RTSP_URL)
+        ret, frame = cap.read()
+        cap.release()
+        if ret:
+            ret, jpg = cv2.imencode('.jpg', frame)
+            if ret:
+                return jpg.tobytes()
+    except Exception:
+        pass
+    return None
 
-if __name__ == "__main__":
+@app.route('/snap', methods=['GET', 'POST'])
+def snapshot():
+    img_bytes = get_snapshot()
+    if img_bytes:
+        return Response(img_bytes, mimetype='image/jpeg')
+    return abort(503, description="Unable to get snapshot from camera.")
+
+if __name__ == '__main__':
     app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
