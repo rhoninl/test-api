@@ -1,129 +1,105 @@
 import os
-import io
 import threading
+import io
 import time
-import requests
-from flask import Flask, Response, request, jsonify, send_file, abort
+from flask import Flask, Response, request, jsonify
 import cv2
-import numpy as np
 
-# Configuration from environment variables
-DEVICE_IP = os.environ.get('DEVICE_IP')
-DEVICE_RTSP_PORT = int(os.environ.get('DEVICE_RTSP_PORT', '554'))
-DEVICE_HTTP_PORT = int(os.environ.get('DEVICE_HTTP_PORT', '80'))
-DEVICE_USER = os.environ.get('DEVICE_USER', 'admin')
-DEVICE_PASS = os.environ.get('DEVICE_PASS', '12345')
+# Environment Variables
+DEVICE_IP = os.environ.get("DEVICE_IP", "192.168.1.64")
+RTSP_PORT = int(os.environ.get("RTSP_PORT", "554"))
+RTSP_USER = os.environ.get("RTSP_USER", "admin")
+RTSP_PASSWORD = os.environ.get("RTSP_PASSWORD", "12345")
+RTSP_PATH = os.environ.get("RTSP_PATH", "Streaming/Channels/101")
+HTTP_SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
+HTTP_SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", "8080"))
 
-SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
-
-RTSP_PATH = os.environ.get('RTSP_PATH', '/Streaming/Channels/101')
-SNAPSHOT_PATH = os.environ.get('SNAPSHOT_PATH', '/ISAPI/Streaming/channels/101/picture')
-
-RTSP_URL = f"rtsp://{DEVICE_USER}:{DEVICE_PASS}@{DEVICE_IP}:{DEVICE_RTSP_PORT}{RTSP_PATH}"
-SNAP_URL = f"http://{DEVICE_IP}:{DEVICE_HTTP_PORT}{SNAPSHOT_PATH}"
+# Construct RTSP URL
+RTSP_URL = f"rtsp://{RTSP_USER}:{RTSP_PASSWORD}@{DEVICE_IP}:{RTSP_PORT}/{RTSP_PATH}"
 
 app = Flask(__name__)
 
-# Thread management for streaming
-streaming_sessions = {}
+# Camera Stream Control State
+streaming_state = {
+    "active": False,
+    "lock": threading.Lock(),
+    "capture": None,
+    "clients": 0
+}
 
-def gen_frames(session_id):
-    cap = cv2.VideoCapture(RTSP_URL)
-    if not cap.isOpened():
-        raise RuntimeError("Cannot open RTSP stream")
-    try:
-        while streaming_sessions.get(session_id, False):
-            ret, frame = cap.read()
-            if not ret:
-                break
-            # Encode the frame as JPEG
-            ret, buffer = cv2.imencode('.jpg', frame)
-            if not ret:
-                continue
-            frame_bytes = buffer.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-    finally:
-        cap.release()
-
-def gen_h264_stream(session_id):
-    cap = cv2.VideoCapture(RTSP_URL)
-    if not cap.isOpened():
-        raise RuntimeError("Cannot open RTSP stream")
-    try:
-        # Use MJPEG by default for browser, but this is H.264 by requirement
-        # We'll send raw H.264 frames (not browser-friendly, but meets spec)
-        while streaming_sessions.get(session_id, False):
-            ret, frame = cap.read()
-            if not ret:
-                break
-            # Encode as H264 using OpenCV VideoWriter into memory
-            height, width, _ = frame.shape
-            fourcc = cv2.VideoWriter_fourcc(*'H264')
-            out = cv2.VideoWriter('appsrc ! videoconvert ! x264enc tune=zerolatency bitrate=500 speed-preset=superfast ! rtph264pay ! udpsink host=127.0.0.1 port=5000', fourcc, 25.0, (width, height))
-            # Instead, for HTTP, just encode to .mp4 in-memory and send as chunked bytes (simulated)
-            # But we can't do real-time H264 HTTP over Flask easily, so for now fallback to MJPEG HTTP stream
-            # For actual H264, a browser player (like hls.js) is needed. Here, we just send MJPEG for browser compatibility
-            ret, buffer = cv2.imencode('.jpg', frame)
-            if not ret:
-                continue
-            frame_bytes = buffer.tobytes()
-            yield (b'--frame\r\n'
-                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
-    finally:
-        cap.release()
-
-@app.route('/play', methods=['POST'])
-def play():
-    session_id = str(time.time())
-    streaming_sessions[session_id] = True
-    return jsonify({
-        "session_id": session_id,
-        "stream_url": f"http://{SERVER_HOST}:{SERVER_PORT}/video?session_id={session_id}"
-    })
-
-@app.route('/halt', methods=['POST'])
-def halt():
-    session_id = request.args.get('session_id')
-    if not session_id:
-        return jsonify({"error": "Missing session_id"}), 400
-    streaming_sessions[session_id] = False
-    return jsonify({"session_id": session_id, "status": "stopped"})
-
-@app.route('/snap', methods=['GET', 'POST'])
-def snap():
-    try:
-        resp = requests.get(SNAP_URL, auth=(DEVICE_USER, DEVICE_PASS), timeout=10)
-        if resp.status_code == 200 and resp.headers.get('Content-Type', '').startswith('image'):
-            return Response(resp.content, mimetype='image/jpeg')
-        else:
-            # Fallback: Use OpenCV snapshot
+def start_stream():
+    with streaming_state["lock"]:
+        if not streaming_state["active"]:
             cap = cv2.VideoCapture(RTSP_URL)
-            ret, frame = cap.read()
-            cap.release()
-            if not ret:
-                abort(500, 'Cannot capture snapshot')
-            _, buffer = cv2.imencode('.jpg', frame)
-            return Response(buffer.tobytes(), mimetype='image/jpeg')
-    except Exception:
-        # Fallback: Use OpenCV snapshot
-        cap = cv2.VideoCapture(RTSP_URL)
-        ret, frame = cap.read()
-        cap.release()
-        if not ret:
-            abort(500, 'Cannot capture snapshot')
-        _, buffer = cv2.imencode('.jpg', frame)
-        return Response(buffer.tobytes(), mimetype='image/jpeg')
+            if not cap.isOpened():
+                return False
+            streaming_state["capture"] = cap
+            streaming_state["active"] = True
+    return True
 
-@app.route('/video', methods=['GET'])
-def video():
-    session_id = request.args.get('session_id')
-    if not session_id or not streaming_sessions.get(session_id, False):
-        return jsonify({"error": "Invalid or inactive session"}), 400
-    # For browsers, MJPEG is best. H.264 raw streaming is not browser friendly.
-    return Response(gen_frames(session_id),
+def stop_stream():
+    with streaming_state["lock"]:
+        if streaming_state["active"]:
+            if streaming_state["capture"]:
+                streaming_state["capture"].release()
+            streaming_state["capture"] = None
+            streaming_state["active"] = False
+
+@app.route('/video/start', methods=['POST'])
+def api_video_start():
+    success = start_stream()
+    return jsonify({"status": "started" if success else "failed"}), 200 if success else 500
+
+@app.route('/video/stop', methods=['POST'])
+def api_video_stop():
+    stop_stream()
+    return jsonify({"status": "stopped"}), 200
+
+def generate_mjpeg():
+    try:
+        with streaming_state["lock"]:
+            streaming_state["clients"] += 1
+        while True:
+            with streaming_state["lock"]:
+                if not streaming_state["active"] or streaming_state["capture"] is None:
+                    break
+                ret, frame = streaming_state["capture"].read()
+            if not ret:
+                time.sleep(0.1)
+                continue
+            ret, jpeg = cv2.imencode('.jpg', frame)
+            if not ret:
+                continue
+            frame_bytes = jpeg.tobytes()
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
+    finally:
+        with streaming_state["lock"]:
+            streaming_state["clients"] -= 1
+            if streaming_state["clients"] == 0 and streaming_state["active"]:
+                stop_stream()
+
+@app.route('/video/stream')
+def video_stream():
+    with streaming_state["lock"]:
+        if not streaming_state["active"]:
+            return "Stream is not active. Start stream via POST /video/start.", 503
+    return Response(generate_mjpeg(),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
-if __name__ == "__main__":
-    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
+@app.route('/')
+def index():
+    return '''
+        <html>
+            <head><title>Hikvision Camera Stream</title></head>
+            <body>
+                <h1>Hikvision Camera Live Stream</h1>
+                <img src="/video/stream" width="640" height="480" />
+                <form action="/video/start" method="post"><button type="submit">Start Stream</button></form>
+                <form action="/video/stop" method="post"><button type="submit">Stop Stream</button></form>
+            </body>
+        </html>
+    '''
+
+if __name__ == '__main__':
+    app.run(host=HTTP_SERVER_HOST, port=HTTP_SERVER_PORT, threaded=True)
