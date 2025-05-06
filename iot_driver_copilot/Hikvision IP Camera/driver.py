@@ -2,129 +2,120 @@ import os
 import threading
 import queue
 import time
-import base64
 from flask import Flask, Response, request, jsonify, stream_with_context
-
 import cv2
 
-# Configuration from environment variables
-DEVICE_IP = os.environ.get("DEVICE_IP")
+# Configuration from environment
+DEVICE_IP = os.environ.get("DEVICE_IP", "192.168.1.64")
 DEVICE_RTSP_PORT = int(os.environ.get("DEVICE_RTSP_PORT", "554"))
-DEVICE_USERNAME = os.environ.get("DEVICE_USERNAME", "admin")
+DEVICE_USER = os.environ.get("DEVICE_USER", "admin")
 DEVICE_PASSWORD = os.environ.get("DEVICE_PASSWORD", "12345")
-DEVICE_CHANNEL = os.environ.get("DEVICE_CHANNEL", "101")  # Default main stream
-
+RTSP_STREAM_PATH = os.environ.get("RTSP_STREAM_PATH", "Streaming/Channels/101")
 SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "8000"))
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
 
-RTSP_PATH = os.environ.get("DEVICE_RTSP_PATH", f"/Streaming/Channels/{DEVICE_CHANNEL}")
-
-# Construct RTSP URL
-RTSP_URL = f"rtsp://{DEVICE_USERNAME}:{DEVICE_PASSWORD}@{DEVICE_IP}:{DEVICE_RTSP_PORT}{RTSP_PATH}"
+RTSP_URL = f"rtsp://{DEVICE_USER}:{DEVICE_PASSWORD}@{DEVICE_IP}:{DEVICE_RTSP_PORT}/{RTSP_STREAM_PATH}"
 
 app = Flask(__name__)
 
-class CameraStreamer:
+class VideoStreamManager:
     def __init__(self, rtsp_url):
         self.rtsp_url = rtsp_url
         self.capture = None
-        self.running = False
-        self.thread = None
         self.frame_queue = queue.Queue(maxsize=10)
+        self.running = False
         self.lock = threading.Lock()
+        self.thread = None
 
-    def start(self):
+    def start_stream(self):
         with self.lock:
-            if self.running:
-                return
-            self.running = True
-            self.capture = cv2.VideoCapture(self.rtsp_url)
-            self.thread = threading.Thread(target=self._update, daemon=True)
-            self.thread.start()
+            if not self.running:
+                self.running = True
+                self.thread = threading.Thread(target=self._capture_frames, daemon=True)
+                self.thread.start()
+                return True
+            return False
 
-    def stop(self):
+    def stop_stream(self):
         with self.lock:
             self.running = False
-            if self.thread:
-                self.thread.join(timeout=1)
-            if self.capture is not None:
-                self.capture.release()
-                self.capture = None
-            while not self.frame_queue.empty():
-                try:
-                    self.frame_queue.get_nowait()
-                except queue.Empty:
-                    break
-
-    def _update(self):
-        while self.running:
-            if self.capture is None or not self.capture.isOpened():
+        # Clear the queue
+        while not self.frame_queue.empty():
+            try:
+                self.frame_queue.get_nowait()
+            except queue.Empty:
                 break
+        # Release capture
+        if self.capture is not None:
+            self.capture.release()
+            self.capture = None
+
+    def _capture_frames(self):
+        self.capture = cv2.VideoCapture(self.rtsp_url)
+        if not self.capture.isOpened():
+            self.running = False
+            return
+        while self.running:
             ret, frame = self.capture.read()
             if not ret:
                 time.sleep(0.1)
                 continue
-            # Encode frame as JPEG
-            ret, jpeg = cv2.imencode('.jpg', frame)
+            # Encode as JPEG for HTTP streaming
+            ret, buffer = cv2.imencode('.jpg', frame)
             if not ret:
                 continue
+            data = buffer.tobytes()
             try:
-                self.frame_queue.put(jpeg.tobytes(), timeout=1)
+                if self.frame_queue.full():
+                    self.frame_queue.get_nowait()
+                self.frame_queue.put_nowait(data)
             except queue.Full:
-                try:
-                    self.frame_queue.get_nowait()  # Drop oldest frame
-                    self.frame_queue.put(jpeg.tobytes(), timeout=1)
-                except queue.Full:
-                    pass
+                pass
+        self.capture.release()
+        self.capture = None
 
-    def get_frame(self):
+    def get_frame(self, timeout=2):
         try:
-            return self.frame_queue.get(timeout=2)
+            return self.frame_queue.get(timeout=timeout)
         except queue.Empty:
             return None
 
-    def is_running(self):
-        with self.lock:
-            return self.running
-
-streamer = CameraStreamer(RTSP_URL)
+video_manager = VideoStreamManager(RTSP_URL)
 
 @app.route('/start', methods=['POST'])
-def api_start():
-    streamer.start()
-    return jsonify({"status": "started"}), 200
+def start_cmd():
+    started = video_manager.start_stream()
+    return jsonify({'status': 'ok', 'started': started})
 
 @app.route('/video/start', methods=['POST'])
-def api_video_start():
-    streamer.start()
-    return jsonify({"status": "video streaming started"}), 200
+def start_video():
+    started = video_manager.start_stream()
+    return jsonify({'status': 'ok', 'started': started})
 
 @app.route('/stop', methods=['POST'])
-def api_stop():
-    streamer.stop()
-    return jsonify({"status": "stopped"}), 200
+def stop_cmd():
+    video_manager.stop_stream()
+    return jsonify({'status': 'ok', 'stopped': True})
 
 @app.route('/video/stop', methods=['POST'])
-def api_video_stop():
-    streamer.stop()
-    return jsonify({"status": "video streaming stopped"}), 200
+def stop_video():
+    video_manager.stop_stream()
+    return jsonify({'status': 'ok', 'stopped': True})
 
-def mjpeg_stream():
-    while streamer.is_running():
-        frame = streamer.get_frame()
+def generate_mjpeg():
+    while video_manager.running:
+        frame = video_manager.get_frame()
         if frame is None:
-            time.sleep(0.05)
+            time.sleep(0.1)
             continue
         yield (b'--frame\r\n'
                b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-    # When stopped, signal end of stream
-    yield b''
 
 @app.route('/stream', methods=['GET'])
-def api_stream():
-    if not streamer.is_running():
-        streamer.start()
-    return Response(stream_with_context(mjpeg_stream()),
+def stream_video():
+    if not video_manager.running:
+        video_manager.start_stream()
+    return Response(stream_with_context(generate_mjpeg()),
                     mimetype='multipart/x-mixed-replace; boundary=frame')
 
 if __name__ == '__main__':
