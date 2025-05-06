@@ -1,126 +1,139 @@
 import os
-import io
 import threading
-import queue
 import time
-from flask import Flask, Response, jsonify, request
-import cv2
+from http.server import BaseHTTPRequestHandler, HTTPServer
+from socketserver import ThreadingMixIn
+import base64
+import socket
 
-# ====== Environment Variables ======
+import cv2
+import numpy as np
+
+# Environment Variables
 DEVICE_IP = os.environ.get("DEVICE_IP", "192.168.1.64")
-DEVICE_USERNAME = os.environ.get("DEVICE_USERNAME", "admin")
-DEVICE_PASSWORD = os.environ.get("DEVICE_PASSWORD", "12345")
-RTSP_PORT = int(os.environ.get("RTSP_PORT", "554"))
-RTSP_PATH = os.environ.get("RTSP_PATH", "Streaming/Channels/101")
+DEVICE_RTSP_PORT = int(os.environ.get("DEVICE_RTSP_PORT", "554"))
+DEVICE_RTSP_USER = os.environ.get("DEVICE_RTSP_USER", "admin")
+DEVICE_RTSP_PASS = os.environ.get("DEVICE_RTSP_PASS", "12345")
+RTSP_STREAM_PATH = os.environ.get("RTSP_STREAM_PATH", "/Streaming/Channels/101")
 SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
 SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
-# ===================================
 
-RTSP_URL = f"rtsp://{DEVICE_USERNAME}:{DEVICE_PASSWORD}@{DEVICE_IP}:{RTSP_PORT}/{RTSP_PATH}"
+RTSP_URL = f"rtsp://{DEVICE_RTSP_USER}:{DEVICE_RTSP_PASS}@{DEVICE_IP}:{DEVICE_RTSP_PORT}{RTSP_STREAM_PATH}"
 
-app = Flask(__name__)
+class VideoStreamHandler:
+    def __init__(self, rtsp_url):
+        self.rtsp_url = rtsp_url
+        self.capture = None
+        self.running = False
+        self.frame = None
+        self.lock = threading.Lock()
+        self.thread = None
 
-# ====== Streaming State Management ======
-streaming_enabled = threading.Event()
-streaming_enabled.clear()
-frame_queue = queue.Queue(maxsize=10)
-stream_thread = None
-stop_thread = threading.Event()
-
-def stream_worker():
-    cap = None
-    try:
-        cap = cv2.VideoCapture(RTSP_URL)
-        if not cap.isOpened():
+    def start(self):
+        if self.running:
             return
-        while not stop_thread.is_set() and streaming_enabled.is_set():
-            ret, frame = cap.read()
+        self.running = True
+        self.thread = threading.Thread(target=self._update, daemon=True)
+        self.thread.start()
+
+    def _update(self):
+        # OpenCV VideoCapture for RTSP stream
+        self.capture = cv2.VideoCapture(self.rtsp_url)
+        while self.running and self.capture.isOpened():
+            ret, frame = self.capture.read()
             if not ret:
-                break
-            # Encode frame as JPEG
-            ret, jpeg = cv2.imencode('.jpg', frame)
-            if not ret:
+                time.sleep(0.1)
                 continue
+            with self.lock:
+                self.frame = frame
+        if self.capture is not None:
+            self.capture.release()
+
+    def stop(self):
+        self.running = False
+        if self.thread is not None:
+            self.thread.join(timeout=2)
+        if self.capture is not None:
+            self.capture.release()
+            self.capture = None
+
+    def get_frame(self):
+        with self.lock:
+            if self.frame is not None:
+                return self.frame.copy()
+            else:
+                return None
+
+# Shared Video Streamer
+streamer = VideoStreamHandler(RTSP_URL)
+
+class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
+    daemon_threads = True
+
+class HikvisionHTTPRequestHandler(BaseHTTPRequestHandler):
+    def do_POST(self):
+        # /start or /video/start
+        if self.path in ["/start", "/video/start"]:
+            streamer.start()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(b'{"status":"started"}')
+            return
+        # /stop or /video/stop
+        if self.path in ["/stop", "/video/stop"]:
+            streamer.stop()
+            self.send_response(200)
+            self.send_header('Content-Type', 'application/json')
+            self.end_headers()
+            self.wfile.write(b'{"status":"stopped"}')
+            return
+        self.send_error(404, "Not Found")
+
+    def do_GET(self):
+        # /stream - MJPEG stream
+        if self.path == "/stream":
+            self.send_response(200)
+            self.send_header('Content-type', 'multipart/x-mixed-replace; boundary=frame')
+            self.end_headers()
+            # Try to keep streaming as long as possible
             try:
-                if frame_queue.full():
-                    try:
-                        frame_queue.get_nowait()
-                    except queue.Empty:
-                        pass
-                frame_queue.put_nowait(jpeg.tobytes())
-            except queue.Full:
-                continue
-            time.sleep(0.02)
+                while streamer.running:
+                    frame = streamer.get_frame()
+                    if frame is None:
+                        time.sleep(0.1)
+                        continue
+                    # Encode as JPEG
+                    ret, jpeg = cv2.imencode('.jpg', frame)
+                    if not ret:
+                        continue
+                    self.wfile.write(b'--frame\r\n')
+                    self.send_header('Content-Type', 'image/jpeg')
+                    self.send_header('Content-Length', str(jpeg.size))
+                    self.end_headers()
+                    self.wfile.write(jpeg.tobytes())
+                    self.wfile.write(b'\r\n')
+                    # Adjust frame rate for browser
+                    time.sleep(0.04)  # ~25fps
+            except (BrokenPipeError, ConnectionResetError, socket.error):
+                pass
+            return
+        self.send_error(404, "Not Found")
+
+    def log_message(self, format, *args):
+        # Suppress default logging
+        return
+
+def run():
+    server = ThreadedHTTPServer((SERVER_HOST, SERVER_PORT), HikvisionHTTPRequestHandler)
+    print(f"Serving on http://{SERVER_HOST}:{SERVER_PORT}")
+    try:
+        server.serve_forever()
+    except KeyboardInterrupt:
+        pass
     finally:
-        if cap:
-            cap.release()
+        streamer.stop()
+        server.server_close()
 
-def start_streaming():
-    global stream_thread
-    if streaming_enabled.is_set():
-        return False
-    streaming_enabled.set()
-    stop_thread.clear()
-    # Clear the queue to avoid stale frames
-    while not frame_queue.empty():
-        try:
-            frame_queue.get_nowait()
-        except queue.Empty:
-            break
-    stream_thread = threading.Thread(target=stream_worker, daemon=True)
-    stream_thread.start()
-    return True
-
-def stop_streaming():
-    streaming_enabled.clear()
-    stop_thread.set()
-    # Drain the queue
-    while not frame_queue.empty():
-        try:
-            frame_queue.get_nowait()
-        except queue.Empty:
-            break
-    return True
-
-# ====== API Endpoints ======
-
-@app.route('/start', methods=['POST'])
-def api_start():
-    started = start_streaming()
-    return jsonify({"success": started, "message": "Streaming started" if started else "Already streaming"}), 200
-
-@app.route('/video/start', methods=['POST'])
-def api_video_start():
-    started = start_streaming()
-    return jsonify({"success": started, "message": "Video stream started" if started else "Already streaming"}), 200
-
-@app.route('/stop', methods=['POST'])
-def api_stop():
-    stopped = stop_streaming()
-    return jsonify({"success": stopped, "message": "Streaming stopped"}), 200
-
-@app.route('/video/stop', methods=['POST'])
-def api_video_stop():
-    stopped = stop_streaming()
-    return jsonify({"success": stopped, "message": "Video stream stopped"}), 200
-
-def gen_mjpeg():
-    while streaming_enabled.is_set():
-        try:
-            frame = frame_queue.get(timeout=1)
-        except queue.Empty:
-            continue
-        yield (b'--frame\r\n'
-               b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-    # When stream stopped, finish generator
-
-@app.route('/stream', methods=['GET'])
-def video_feed():
-    if not streaming_enabled.is_set():
-        return jsonify({"error": "Streaming not started"}), 400
-    return Response(gen_mjpeg(),
-                    mimetype='multipart/x-mixed-replace; boundary=frame')
-
-# ====== Main ======
 if __name__ == "__main__":
-    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
+    run()
