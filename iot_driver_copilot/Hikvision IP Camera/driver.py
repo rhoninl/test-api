@@ -1,146 +1,316 @@
 import os
 import asyncio
-import aiohttp
-import aiohttp.web
+import threading
 import base64
+import struct
+from typing import Optional
 
-import cv2
-import numpy as np
+from fastapi import FastAPI, Request, Response, status
+from fastapi.responses import StreamingResponse, JSONResponse
+from starlette.middleware.cors import CORSMiddleware
 
-# ----- Configuration from Environment Variables -----
+import aiohttp
 
-CAMERA_IP = os.environ.get("HIKVISION_CAMERA_IP", "192.168.1.64")
-CAMERA_RTSP_PORT = int(os.environ.get("HIKVISION_CAMERA_RTSP_PORT", "554"))
-CAMERA_USERNAME = os.environ.get("HIKVISION_CAMERA_USERNAME", "admin")
-CAMERA_PASSWORD = os.environ.get("HIKVISION_CAMERA_PASSWORD", "12345")
-CAMERA_STREAM_PATH = os.environ.get("HIKVISION_CAMERA_STREAM_PATH", "/Streaming/Channels/101")
-SERVER_HOST = os.environ.get("HTTP_SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("HTTP_SERVER_PORT", "8080"))
+# ========== Environment Variables ==========
+DEVICE_IP = os.environ.get("DEVICE_IP", "192.168.1.64")
+DEVICE_USERNAME = os.environ.get("DEVICE_USERNAME", "admin")
+DEVICE_PASSWORD = os.environ.get("DEVICE_PASSWORD", "12345")
+RTSP_PORT = int(os.environ.get("RTSP_PORT", "554"))
+RTSP_PATH = os.environ.get("RTSP_PATH", "/Streaming/Channels/101")
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8000"))
 
-# ----- RTSP URL Construction -----
+# ========== RTSP Client Implementation ==========
 
-def get_rtsp_url():
-    user_pass = f"{CAMERA_USERNAME}:{CAMERA_PASSWORD}@"
-    return f"rtsp://{user_pass}{CAMERA_IP}:{CAMERA_RTSP_PORT}{CAMERA_STREAM_PATH}"
+class RTSPClient:
+    def __init__(self, url: str, username: str = "", password: str = ""):
+        self.url = url
+        self.username = username
+        self.password = password
+        self.session = None
+        self.transport = None
+        self.seq = 1
+        self.session_id = None
+        self.socket_reader = None
+        self.socket_writer = None
+        self.streaming = False
+        self.control_url = None
 
-# ----- Streaming State Management -----
+    async def connect(self):
+        from urllib.parse import urlparse
+        parsed = urlparse(self.url)
+        host = parsed.hostname
+        port = parsed.port or 554
 
-class StreamSession:
-    """Manages the video capture and streaming lifecycle."""
-    def __init__(self):
-        self.active = False
-        self.cap = None
+        self.socket_reader, self.socket_writer = await asyncio.open_connection(host, port)
+
+        await self.send_options()
+        await self.send_describe()
+        await self.send_setup()
+        await self.send_play()
+        self.streaming = True
+
+    async def disconnect(self):
+        try:
+            await self.send_teardown()
+        except Exception:
+            pass
+        if self.socket_writer:
+            self.socket_writer.close()
+            await self.socket_writer.wait_closed()
+        self.streaming = False
+
+    def _auth_header(self):
+        userpass = f"{self.username}:{self.password}"
+        token = base64.b64encode(userpass.encode()).decode()
+        return f"Authorization: Basic {token}\r\n"
+
+    async def send_options(self):
+        req = (
+            f"OPTIONS {self.url} RTSP/1.0\r\n"
+            f"CSeq: {self.seq}\r\n"
+            f"{self._auth_header()}"
+            "\r\n"
+        )
+        self.seq += 1
+        self.socket_writer.write(req.encode())
+        await self.socket_writer.drain()
+        await self._read_response()
+
+    async def send_describe(self):
+        req = (
+            f"DESCRIBE {self.url} RTSP/1.0\r\n"
+            f"CSeq: {self.seq}\r\n"
+            "Accept: application/sdp\r\n"
+            f"{self._auth_header()}"
+            "\r\n"
+        )
+        self.seq += 1
+        self.socket_writer.write(req.encode())
+        await self.socket_writer.drain()
+        data = await self._read_response()
+        # parse control url from SDP
+        sdp = data.split('\r\n\r\n', 1)[-1]
+        for line in sdp.splitlines():
+            if line.startswith('a=control:'):
+                self.control_url = line.split(':', 1)[1]
+        if not self.control_url.startswith('rtsp://'):
+            self.control_url = self.url + '/' + self.control_url
+
+    async def send_setup(self):
+        # use TCP interleaved
+        req = (
+            f"SETUP {self.control_url} RTSP/1.0\r\n"
+            f"CSeq: {self.seq}\r\n"
+            "Transport: RTP/AVP/TCP;unicast;interleaved=0-1\r\n"
+            f"{self._auth_header()}"
+            "\r\n"
+        )
+        self.seq += 1
+        self.socket_writer.write(req.encode())
+        await self.socket_writer.drain()
+        data = await self._read_response()
+        for line in data.splitlines():
+            if line.lower().startswith('session:'):
+                self.session_id = line.split(':', 1)[1].strip().split(';')[0]
+
+    async def send_play(self):
+        req = (
+            f"PLAY {self.url} RTSP/1.0\r\n"
+            f"CSeq: {self.seq}\r\n"
+            f"Session: {self.session_id}\r\n"
+            f"{self._auth_header()}"
+            "\r\n"
+        )
+        self.seq += 1
+        self.socket_writer.write(req.encode())
+        await self.socket_writer.drain()
+        await self._read_response()
+
+    async def send_teardown(self):
+        req = (
+            f"TEARDOWN {self.url} RTSP/1.0\r\n"
+            f"CSeq: {self.seq}\r\n"
+            f"Session: {self.session_id}\r\n"
+            f"{self._auth_header()}"
+            "\r\n"
+        )
+        self.seq += 1
+        self.socket_writer.write(req.encode())
+        await self.socket_writer.drain()
+        await self._read_response()
+
+    async def _read_response(self):
+        data = b''
+        while True:
+            line = await self.socket_reader.readline()
+            if not line or line == b'\r\n':
+                break
+            data += line
+        rest = b''
+        if b'Content-Length:' in data:
+            # Handle SDP or other data
+            for l in data.split(b'\r\n'):
+                if l.lower().startswith(b'content-length:'):
+                    length = int(l.split(b':')[1].strip())
+                    break
+            rest = await self.socket_reader.readexactly(length)
+        return data.decode(errors="ignore") + rest.decode(errors="ignore")
+
+    async def read_interleaved(self):
+        # Receives RTP over TCP interleaved stream, yields H264 NAL units
+        while self.streaming:
+            b = await self.socket_reader.readexactly(1)
+            if b != b'$':
+                continue  # Not an interleaved packet
+            channel = await self.socket_reader.readexactly(1)
+            size = await self.socket_reader.readexactly(2)
+            packet_length = struct.unpack('>H', size)[0]
+            packet = await self.socket_reader.readexactly(packet_length)
+            if channel == b'\x00':  # RTP data
+                # Extract H264 NAL units from RTP
+                nals = self._extract_h264_nals(packet)
+                for nalu in nals:
+                    yield nalu
+
+    def _extract_h264_nals(self, rtp_packet):
+        # Minimal RTP parse for H264 payload (single NAL, FU-A), returns list of NALU bytes
+        nals = []
+        if len(rtp_packet) < 12:
+            return nals
+        header_len = 12
+        cc = rtp_packet[0] & 0x0F
+        header_len += cc * 4
+        payload = rtp_packet[header_len:]
+        if not payload:
+            return nals
+
+        nal_type = payload[0] & 0x1F
+        if nal_type >= 1 and nal_type <= 23:
+            nals.append(b'\x00\x00\x00\x01' + payload)
+        elif nal_type == 28:  # FU-A
+            fu_indicator = payload[0]
+            fu_header = payload[1]
+            start_bit = fu_header & 0x80
+            end_bit = fu_header & 0x40
+            nal_unit_type = fu_header & 0x1F
+            reconstructed_nal = bytes([(fu_indicator & 0xE0) | nal_unit_type])
+            if start_bit:
+                nalu = b'\x00\x00\x00\x01' + reconstructed_nal + payload[2:]
+                self._fu_buffer = nalu
+            else:
+                if hasattr(self, '_fu_buffer'):
+                    self._fu_buffer += payload[2:]
+                else:
+                    self._fu_buffer = payload[2:]
+            if end_bit and hasattr(self, '_fu_buffer'):
+                nals.append(self._fu_buffer)
+                del self._fu_buffer
+        # else ignore other types
+        return nals
+
+# ========== Camera Streaming Session Management ==========
+
+class CameraSession:
+    def __init__(self, rtsp_url, username, password):
+        self.rtsp_url = rtsp_url
+        self.username = username
+        self.password = password
+        self.rtsp_client: Optional[RTSPClient] = None
+        self.streaming = False
         self.lock = asyncio.Lock()
-        self.latest_frame = None
-        self.read_task = None
+        self.clients = 0
+        self._stream_task = None
+        self._queue = asyncio.Queue(maxsize=100)
 
     async def start(self):
         async with self.lock:
-            if self.active:
+            if self.streaming:
                 return
-            self.cap = cv2.VideoCapture(get_rtsp_url())
-            if not self.cap.isOpened():
-                raise RuntimeError("Failed to open RTSP stream.")
-            self.active = True
-            self.read_task = asyncio.create_task(self._frame_reader())
+            self.rtsp_client = RTSPClient(self.rtsp_url, self.username, self.password)
+            await self.rtsp_client.connect()
+            self.streaming = True
+            self._stream_task = asyncio.create_task(self._stream())
 
     async def stop(self):
         async with self.lock:
-            self.active = False
-            if self.read_task:
-                self.read_task.cancel()
-                with contextlib.suppress(asyncio.CancelledError):
-                    await self.read_task
-                self.read_task = None
-            if self.cap:
-                self.cap.release()
-                self.cap = None
-            self.latest_frame = None
+            self.streaming = False
+            if self.rtsp_client:
+                await self.rtsp_client.disconnect()
+                self.rtsp_client = None
+            if self._stream_task:
+                self._stream_task.cancel()
+                self._stream_task = None
+            while not self._queue.empty():
+                try:
+                    self._queue.get_nowait()
+                except Exception:
+                    break
 
-    async def _frame_reader(self):
+    async def _stream(self):
         try:
-            while self.active and self.cap and self.cap.isOpened():
-                ret, frame = self.cap.read()
-                if not ret:
-                    await asyncio.sleep(0.05)
-                    continue
-                # Encode as JPEG for browser compatibility
-                ret, buf = cv2.imencode('.jpg', frame)
-                if ret:
-                    self.latest_frame = buf.tobytes()
-                await asyncio.sleep(0.01)  # ~100fps max
+            async for nalu in self.rtsp_client.read_interleaved():
+                for _ in range(self.clients):
+                    await self._queue.put(nalu)
         except asyncio.CancelledError:
             pass
+        except Exception:
+            pass
 
-    async def get_frame(self):
-        return self.latest_frame
-
-stream_session = StreamSession()
-
-# ----- HTTP API -----
-
-routes = aiohttp.web.RouteTableDef()
-
-@routes.post("/start")
-@routes.post("/video/start")
-async def start_stream(request):
-    try:
-        await stream_session.start()
-        return aiohttp.web.json_response({"status": "started"})
-    except Exception as e:
-        return aiohttp.web.json_response({"status": "error", "msg": str(e)}, status=500)
-
-@routes.post("/stop")
-@routes.post("/video/stop")
-async def stop_stream(request):
-    try:
-        await stream_session.stop()
-        return aiohttp.web.json_response({"status": "stopped"})
-    except Exception as e:
-        return aiohttp.web.json_response({"status": "error", "msg": str(e)}, status=500)
-
-@routes.get("/stream")
-async def video_stream(request):
-    # Start the stream if not already running
-    if not stream_session.active:
+    async def get_stream(self):
+        self.clients += 1
         try:
-            await stream_session.start()
-        except Exception as e:
-            return aiohttp.web.Response(status=500, text=f"Failed to start: {str(e)}")
+            while self.streaming:
+                nalu = await self._queue.get()
+                yield nalu
+        finally:
+            self.clients -= 1
 
-    async def mjpeg_response():
-        boundary = "frame"
-        while True:
-            frame = await stream_session.get_frame()
-            if frame is not None:
-                yield (
-                    f"--{boundary}\r\n"
-                    "Content-Type: image/jpeg\r\n"
-                    f"Content-Length: {len(frame)}\r\n"
-                    "\r\n"
-                ).encode('utf-8')
-                yield frame
-                yield b"\r\n"
-            await asyncio.sleep(0.03)  # ~30fps
+# ========== FastAPI App & Endpoints ==========
 
+app = FastAPI(
+    title="Hikvision IP Camera Driver",
+    description="Device driver for Hikvision IP Camera with HTTP streaming proxy.",
+    version="1.0.0",
+)
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+rtsp_url = f"rtsp://{DEVICE_IP}:{RTSP_PORT}{RTSP_PATH}"
+camera_session = CameraSession(rtsp_url, DEVICE_USERNAME, DEVICE_PASSWORD)
+
+@app.post("/start")
+@app.post("/video/start")
+async def start_stream():
+    await camera_session.start()
+    return JSONResponse({"status": "started"}, status_code=status.HTTP_200_OK)
+
+@app.post("/stop")
+@app.post("/video/stop")
+async def stop_stream():
+    await camera_session.stop()
+    return JSONResponse({"status": "stopped"}, status_code=status.HTTP_200_OK)
+
+@app.get("/stream")
+async def get_stream():
+    if not camera_session.streaming:
+        return JSONResponse({"error": "Stream not started"}, status_code=status.HTTP_400_BAD_REQUEST)
+    async def streamer():
+        async for nalu in camera_session.get_stream():
+            yield nalu
     headers = {
-        "Content-Type": 'multipart/x-mixed-replace; boundary=frame',
+        "Content-Type": "video/h264",
         "Cache-Control": "no-cache",
         "Pragma": "no-cache",
     }
-    return aiohttp.web.Response(body=mjpeg_response(), headers=headers)
-
-# ----- App Factory -----
-
-async def on_shutdown(app):
-    await stream_session.stop()
-
-def main():
-    app = aiohttp.web.Application()
-    app.add_routes(routes)
-    app.on_shutdown.append(on_shutdown)
-    aiohttp.web.run_app(app, host=SERVER_HOST, port=SERVER_PORT)
+    return StreamingResponse(streamer(), media_type="video/h264", headers=headers)
 
 if __name__ == "__main__":
-    import contextlib
-    main()
+    import uvicorn
+    uvicorn.run(app, host=SERVER_HOST, port=SERVER_PORT)
