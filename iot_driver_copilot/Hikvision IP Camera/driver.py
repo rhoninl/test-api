@@ -1,161 +1,100 @@
 import os
+import io
 import threading
-import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from socketserver import ThreadingMixIn
-import requests
 import cv2
-import numpy as np
+import time
+from flask import Flask, Response, request, jsonify
 
-# Environment variables
-DEVICE_IP = os.getenv('DEVICE_IP', '192.168.1.64')
-DEVICE_RTSP_PORT = int(os.getenv('DEVICE_RTSP_PORT', '554'))
-DEVICE_USERNAME = os.getenv('DEVICE_USERNAME', 'admin')
-DEVICE_PASSWORD = os.getenv('DEVICE_PASSWORD', '12345')
-DEVICE_HTTP_PORT = int(os.getenv('DEVICE_HTTP_PORT', '80'))
+# --- Configuration from environment variables ---
+DEVICE_IP = os.environ.get("DEVICE_IP", "192.168.1.64")
+DEVICE_RTSP_PORT = int(os.environ.get("DEVICE_RTSP_PORT", "554"))
+DEVICE_RTSP_USER = os.environ.get("DEVICE_RTSP_USER", "admin")
+DEVICE_RTSP_PASSWORD = os.environ.get("DEVICE_RTSP_PASSWORD", "12345")
+DEVICE_RTSP_PATH = os.environ.get("DEVICE_RTSP_PATH", "Streaming/Channels/101")
+SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
+SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
 
-SERVER_HOST = os.getenv('SERVER_HOST', '0.0.0.0')
-SERVER_PORT = int(os.getenv('SERVER_PORT', '8080'))
+RTSP_URL = f"rtsp://{DEVICE_RTSP_USER}:{DEVICE_RTSP_PASSWORD}@{DEVICE_IP}:{DEVICE_RTSP_PORT}/{DEVICE_RTSP_PATH}"
 
-RTSP_STREAM_PATH = os.getenv('RTSP_STREAM_PATH', '/Streaming/Channels/101')
-SNAPSHOT_PATH = os.getenv('SNAPSHOT_PATH', '/ISAPI/Streaming/channels/101/picture')
-RTSP_URL = f"rtsp://{DEVICE_USERNAME}:{DEVICE_PASSWORD}@{DEVICE_IP}:{DEVICE_RTSP_PORT}{RTSP_STREAM_PATH}"
-
-# Global streaming control
-streaming_active = threading.Event()
-streaming_active.clear()
-stream_lock = threading.Lock()
-
-class StreamingHandler:
+# --- Stream State Management ---
+class CameraStream:
     def __init__(self, rtsp_url):
         self.rtsp_url = rtsp_url
         self.capture = None
-        self.thread = None
         self.frame = None
-        self.frame_lock = threading.Lock()
         self.running = False
+        self.lock = threading.Lock()
+        self.thread = None
 
     def start(self):
-        with stream_lock:
-            if self.running:
-                return
-            self.running = True
-            self.capture = cv2.VideoCapture(self.rtsp_url)
-            self.thread = threading.Thread(target=self.update, daemon=True)
-            self.thread.start()
-            streaming_active.set()
+        with self.lock:
+            if not self.running:
+                self.running = True
+                self.thread = threading.Thread(target=self._update_stream, daemon=True)
+                self.thread.start()
 
     def stop(self):
-        with stream_lock:
+        with self.lock:
             self.running = False
-            streaming_active.clear()
             if self.capture:
                 self.capture.release()
                 self.capture = None
+            self.thread = None
 
-    def update(self):
-        while self.running:
-            if self.capture is None:
-                break
+    def _update_stream(self):
+        self.capture = cv2.VideoCapture(self.rtsp_url)
+        while self.running and self.capture.isOpened():
             ret, frame = self.capture.read()
-            if ret:
-                with self.frame_lock:
-                    self.frame = frame
-            else:
-                time.sleep(0.05)
-        self.stop()
+            if not ret:
+                time.sleep(0.1)
+                continue
+            with self.lock:
+                self.frame = frame
+        if self.capture:
+            self.capture.release()
+            self.capture = None
 
     def get_frame(self):
-        with self.frame_lock:
+        with self.lock:
             if self.frame is not None:
                 ret, jpeg = cv2.imencode('.jpg', self.frame)
                 if ret:
                     return jpeg.tobytes()
             return None
 
-    def mjpeg_generator(self):
-        while streaming_active.is_set():
-            frame = self.get_frame()
-            if frame is not None:
-                yield (b'--frame\r\n'
-                       b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
-            else:
-                time.sleep(0.05)
+camera_stream = CameraStream(RTSP_URL)
 
-stream_handler = StreamingHandler(RTSP_URL)
+# --- Flask HTTP Server ---
+app = Flask(__name__)
 
-class HikvisionHTTPRequestHandler(BaseHTTPRequestHandler):
+@app.route('/video/start', methods=['POST'])
+def api_video_start():
+    camera_stream.start()
+    return jsonify({"status": "streaming_started"}), 200
 
-    def do_GET(self):
-        if self.path == '/snap':
-            snapshot_url = f"http://{DEVICE_IP}:{DEVICE_HTTP_PORT}{SNAPSHOT_PATH}"
-            try:
-                resp = requests.get(snapshot_url, auth=(DEVICE_USERNAME, DEVICE_PASSWORD), timeout=5, stream=True)
-                if resp.status_code == 200 and resp.headers.get('Content-Type', '').startswith('image'):
-                    self.send_response(200)
-                    self.send_header('Content-type', 'image/jpeg')
-                    self.end_headers()
-                    for chunk in resp.iter_content(4096):
-                        self.wfile.write(chunk)
-                else:
-                    self.send_response(502)
-                    self.end_headers()
-                    self.wfile.write(b"Unable to fetch snapshot")
-            except Exception as e:
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(b"Snapshot fetch error: " + str(e).encode())
-        elif self.path == '/stream':
-            if not streaming_active.is_set():
-                self.send_response(403)
-                self.end_headers()
-                self.wfile.write(b"Streaming not started")
-                return
-            self.send_response(200)
-            self.send_header('Content-type', 'multipart/x-mixed-replace; boundary=frame')
-            self.end_headers()
-            for frame in stream_handler.mjpeg_generator():
-                try:
-                    self.wfile.write(frame)
-                except Exception:
-                    break
+@app.route('/video/stop', methods=['POST'])
+def api_video_stop():
+    camera_stream.stop()
+    return jsonify({"status": "streaming_stopped"}), 200
+
+def gen_mjpeg_stream():
+    while True:
+        if not camera_stream.running:
+            time.sleep(0.2)
+            continue
+        frame = camera_stream.get_frame()
+        if frame:
+            yield (b'--frame\r\n'
+                   b'Content-Type: image/jpeg\r\n\r\n' + frame + b'\r\n')
         else:
-            self.send_response(404)
-            self.end_headers()
-            self.wfile.write(b"Not found")
+            time.sleep(0.02)
 
-    def do_POST(self):
-        if self.path == '/start':
-            stream_handler.start()
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"Streaming started")
-        elif self.path == '/stop':
-            stream_handler.stop()
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"Streaming stopped")
-        else:
-            self.send_response(404)
-            self.end_headers()
-            self.wfile.write(b"Not found")
-
-    def log_message(self, format, *args):
-        # Suppress default logging to keep output clean
-        pass
-
-class ThreadedHTTPServer(ThreadingMixIn, HTTPServer):
-    daemon_threads = True
-
-def run():
-    server = ThreadedHTTPServer((SERVER_HOST, SERVER_PORT), HikvisionHTTPRequestHandler)
-    try:
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        stream_handler.stop()
-        server.server_close()
+@app.route('/video')
+def video_feed():
+    if not camera_stream.running:
+        return "Stream not started. POST to /video/start first.", 503
+    return Response(gen_mjpeg_stream(),
+                    mimetype='multipart/x-mixed-replace; boundary=frame')
 
 if __name__ == '__main__':
-    run()
+    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
