@@ -1,103 +1,95 @@
 import os
+import uuid
 import threading
-import io
-import time
-from http.server import BaseHTTPRequestHandler, HTTPServer
-import socketserver
 import cv2
-import numpy as np
+import time
+from flask import Flask, Response, request, jsonify, abort
 
 # Configuration from environment variables
-DEVICE_IP = os.environ.get("DEVICE_IP", "192.168.1.64")
-DEVICE_RTSP_PORT = int(os.environ.get("DEVICE_RTSP_PORT", "554"))
-DEVICE_USERNAME = os.environ.get("DEVICE_USERNAME", "admin")
-DEVICE_PASSWORD = os.environ.get("DEVICE_PASSWORD", "admin123")
-DEVICE_RTSP_PATH = os.environ.get("DEVICE_RTSP_PATH", "Streaming/Channels/101")
-SERVER_HOST = os.environ.get("SERVER_HOST", "0.0.0.0")
-SERVER_PORT = int(os.environ.get("SERVER_PORT", "8080"))
+DEVICE_IP = os.environ.get('DEVICE_IP', '192.168.1.64')
+RTSP_PORT = int(os.environ.get('RTSP_PORT', '554'))
+RTSP_USER = os.environ.get('RTSP_USER', 'admin')
+RTSP_PASSWORD = os.environ.get('RTSP_PASSWORD', '12345')
+RTSP_PATH = os.environ.get('RTSP_PATH', '/Streaming/Channels/101')
+SERVER_HOST = os.environ.get('SERVER_HOST', '0.0.0.0')
+SERVER_PORT = int(os.environ.get('SERVER_PORT', '8080'))
 
-RTSP_URL = f"rtsp://{DEVICE_USERNAME}:{DEVICE_PASSWORD}@{DEVICE_IP}:{DEVICE_RTSP_PORT}/{DEVICE_RTSP_PATH}"
+RTSP_URL = f'rtsp://{RTSP_USER}:{RTSP_PASSWORD}@{DEVICE_IP}:{RTSP_PORT}{RTSP_PATH}'
 
-class StreamBuffer:
-    def __init__(self):
-        self.frame = None
-        self.lock = threading.Lock()
+app = Flask(__name__)
 
-    def update(self, frame):
-        with self.lock:
-            self.frame = frame
+# Session state
+sessions = {}
+sessions_lock = threading.Lock()
 
-    def get(self):
-        with self.lock:
-            return self.frame
-
-stream_buffer = StreamBuffer()
-stop_event = threading.Event()
-
-def stream_capture():
-    cap = cv2.VideoCapture(RTSP_URL)
-    if not cap.isOpened():
-        print("Failed to connect to camera stream.")
-        return
-    while not stop_event.is_set():
+def gen_mjpeg_frames(cap, session_id):
+    while True:
+        with sessions_lock:
+            session = sessions.get(session_id)
+            if not session or not session['active']:
+                break
         ret, frame = cap.read()
-        if ret:
-            # Encode frame as JPEG for browser compatibility
-            ret, jpeg = cv2.imencode('.jpg', frame)
-            if ret:
-                stream_buffer.update(jpeg.tobytes())
-        else:
-            # Attempt to reconnect after a short delay
-            time.sleep(0.5)
-            cap.release()
-            cap = cv2.VideoCapture(RTSP_URL)
+        if not ret:
+            time.sleep(0.1)
+            continue
+        ret, jpeg = cv2.imencode('.jpg', frame)
+        if not ret:
+            continue
+        frame_bytes = jpeg.tobytes()
+        yield (b'--frame\r\n'
+               b'Content-Type: image/jpeg\r\n\r\n' + frame_bytes + b'\r\n')
     cap.release()
 
-class StreamingHandler(BaseHTTPRequestHandler):
-    def do_GET(self):
-        if self.path == '/stream':
-            self.send_response(200)
-            self.send_header('Age', '0')
-            self.send_header('Cache-Control', 'no-cache, private')
-            self.send_header('Pragma', 'no-cache')
-            self.send_header('Content-Type', 'multipart/x-mixed-replace; boundary=frame')
-            self.end_headers()
-            try:
-                while not stop_event.is_set():
-                    frame = stream_buffer.get()
-                    if frame is not None:
-                        self.wfile.write(b'--frame\r\n')
-                        self.wfile.write(b'Content-Type: image/jpeg\r\n')
-                        self.wfile.write(b'Content-Length: %d\r\n\r\n' % len(frame))
-                        self.wfile.write(frame)
-                        self.wfile.write(b'\r\n')
-                    time.sleep(0.04)  # ~25fps
-            except Exception:
-                pass
-        else:
-            self.send_response(404)
-            self.end_headers()
-            self.wfile.write(b'404 Not Found')
+@app.route('/video-session', methods=['POST'])
+def start_video_session():
+    with sessions_lock:
+        # Close previous sessions
+        for sid in list(sessions.keys()):
+            sessions[sid]['active'] = False
+            if sessions[sid]['capture']:
+                sessions[sid]['capture'].release()
+            del sessions[sid]
+        # Create new session
+        session_id = str(uuid.uuid4())
+        cap = cv2.VideoCapture(RTSP_URL)
+        if not cap.isOpened():
+            return jsonify({"error": "Failed to connect to camera RTSP stream"}), 500
+        sessions[session_id] = {
+            'capture': cap,
+            'active': True,
+            'created': time.time(),
+            'access_url': f'http://{SERVER_HOST}:{SERVER_PORT}/video-session?session_id={session_id}',
+            'rtsp_url': RTSP_URL
+        }
+        return jsonify({
+            'session_id': session_id,
+            'access_url': sessions[session_id]['access_url'],
+            'rtsp_url': RTSP_URL
+        })
 
-    def log_message(self, format, *args):
-        return  # Suppress default logging
+@app.route('/video-session', methods=['GET'])
+def get_video_session():
+    session_id = request.args.get('session_id')
+    with sessions_lock:
+        if not session_id or session_id not in sessions or not sessions[session_id]['active']:
+            return jsonify({"error": "No active session. Start one with POST /video-session."}), 404
+        cap = sessions[session_id]['capture']
+    return Response(
+        gen_mjpeg_frames(cap, session_id),
+        mimetype='multipart/x-mixed-replace; boundary=frame'
+    )
 
-class ThreadedHTTPServer(socketserver.ThreadingMixIn, HTTPServer):
-    daemon_threads = True
-
-def run():
-    capture_thread = threading.Thread(target=stream_capture, daemon=True)
-    capture_thread.start()
-    server = ThreadedHTTPServer((SERVER_HOST, SERVER_PORT), StreamingHandler)
-    try:
-        print(f"Starting server at http://{SERVER_HOST}:{SERVER_PORT}/stream")
-        server.serve_forever()
-    except KeyboardInterrupt:
-        pass
-    finally:
-        stop_event.set()
-        server.shutdown()
-        server.server_close()
+@app.route('/video-session', methods=['DELETE'])
+def stop_video_session():
+    session_id = request.args.get('session_id')
+    with sessions_lock:
+        if not session_id or session_id not in sessions:
+            return jsonify({'error': 'Session not found'}), 404
+        sessions[session_id]['active'] = False
+        if sessions[session_id]['capture']:
+            sessions[session_id]['capture'].release()
+        del sessions[session_id]
+    return jsonify({'status': 'session stopped'})
 
 if __name__ == '__main__':
-    run()
+    app.run(host=SERVER_HOST, port=SERVER_PORT, threaded=True)
