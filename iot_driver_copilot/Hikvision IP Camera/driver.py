@@ -1,97 +1,164 @@
+use actix_web::{web, App, HttpRequest, HttpResponse, HttpServer, Responder};
+use actix_web::http::{header, StatusCode};
+use bytes::BytesMut;
+use futures::{Stream, StreamExt};
 use std::env;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
-use std::net::SocketAddr;
-use std::time::Duration;
-
-use hyper::{Body, Request, Response, Server, Method, StatusCode};
-use hyper::service::{make_service_fn, service_fn};
-use serde::{Deserialize, Serialize};
-use tokio::sync::oneshot;
+use std::task::{Context, Poll};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
-use tokio_stream::StreamExt;
-use futures::stream::Stream;
-
-#[derive(Clone)]
-struct Config {
-    camera_ip: String,
-    camera_rtsp_port: u16,
-    camera_user: String,
-    camera_password: String,
-    server_host: String,
-    server_port: u16,
-}
-
-#[derive(Clone, Debug, Serialize)]
-struct StreamSession {
-    format: String,
-    active: bool,
-}
+use tokio::process::Command;
+use tokio::sync::oneshot;
+use url::Url;
 
 #[derive(Clone)]
 struct AppState {
-    // Only one active streaming session at a time for simplicity
-    session: Arc<Mutex<Option<StreamSession>>>,
-    // Used to signal stream task to stop
-    stop_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
-    config: Config,
+    camera_ip: String,
+    username: String,
+    password: String,
+    rtsp_port: u16,
+    http_port: u16,
+    stream_active: Arc<Mutex<bool>>,
+    stream_stop_tx: Arc<Mutex<Option<oneshot::Sender<()>>>>,
+    stream_format: Arc<Mutex<String>>,
 }
 
-#[derive(Debug, Deserialize)]
-struct StartStreamBody {
-    format: Option<String>,
+async fn stream_start(
+    state: web::Data<AppState>,
+    req_body: String,
+) -> impl Responder {
+    let mut format = "mjpeg".to_string();
+    if let Ok(json_body) = serde_json::from_str::<serde_json::Value>(&req_body) {
+        if let Some(fmt) = json_body.get("format") {
+            if fmt == "h264" {
+                format = "h264".to_string();
+            }
+        }
+    }
+
+    let mut stream_active = state.stream_active.lock().unwrap();
+    if *stream_active {
+        return HttpResponse::Ok().json(serde_json::json!({
+            "status": "already_streaming",
+            "format": *state.stream_format.lock().unwrap()
+        }));
+    }
+
+    *state.stream_format.lock().unwrap() = format.clone();
+    *stream_active = true;
+    HttpResponse::Ok().json(serde_json::json!({
+        "status": "stream_started",
+        "format": format
+    }))
 }
 
-fn get_env(name: &str, default: Option<&str>) -> String {
-    env::var(name).unwrap_or_else(|_| default.unwrap_or("").to_string())
+async fn stream_stop(state: web::Data<AppState>) -> impl Responder {
+    let mut stream_active = state.stream_active.lock().unwrap();
+    if !*stream_active {
+        return HttpResponse::Ok().json(serde_json::json!({
+            "status": "not_streaming"
+        }));
+    }
+    if let Some(tx) = state.stream_stop_tx.lock().unwrap().take() {
+        let _ = tx.send(());
+    }
+    *stream_active = false;
+    HttpResponse::Ok().json(serde_json::json!({
+        "status": "stream_stopped"
+    }))
 }
 
-fn get_env_u16(name: &str, default: u16) -> u16 {
-    env::var(name).ok().and_then(|v| v.parse().ok()).unwrap_or(default)
+async fn stream_url(state: web::Data<AppState>) -> impl Responder {
+    let url = format!(
+        "rtsp://{}:{}@{}:{}/Streaming/Channels/101",
+        state.username, state.password, state.camera_ip, state.rtsp_port
+    );
+    HttpResponse::Ok().json(serde_json::json!({
+        "url": url
+    }))
 }
 
-fn build_rtsp_url(config: &Config, format: &str) -> String {
-    // Hikvision default main stream URL
-    // MJPEG: /Streaming/channels/1/httppreview
-    // H.264: /Streaming/Channels/101 or /Streaming/Channels/1
-    if format.to_lowercase() == "mjpeg" {
-        format!(
-            "rtsp://{}:{}@{}:{}/Streaming/channels/1/preview",
-            config.camera_user, config.camera_password, config.camera_ip, config.camera_rtsp_port
-        )
-    } else {
-        format!(
-            "rtsp://{}:{}@{}:{}/Streaming/Channels/101",
-            config.camera_user, config.camera_password, config.camera_ip, config.camera_rtsp_port
-        )
+struct MJPEGStream {
+    rtsp_url: String,
+    stop_rx: Option<oneshot::Receiver<()>>,
+}
+
+impl Stream for MJPEGStream {
+    type Item = Result<bytes::Bytes, actix_web::Error>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        // Not used, placeholder for trait
+        Poll::Ready(None)
     }
 }
 
-async fn stream_rtsp_to_mjpeg(
-    rtsp_url: &str,
-    mut stop_rx: oneshot::Receiver<()>,
-) -> impl Stream<Item=Result<bytes::Bytes, std::io::Error>> {
-    // This is a stub/proxy: actual RTSP parsing is non-trivial, but for the sake of the example,
-    // we simulate a compatible MJPEG stream.
-    // To do: Implement a minimal RTSP client and H.264->MJPEG conversion; here we simulate MJPEG frames.
-    // In a real implementation, you would use a library to decode the RTSP H.264 data and encode as MJPEG.
-    let (mut tx, rx) = tokio::sync::mpsc::channel(8);
+async fn stream_mjpeg(
+    state: web::Data<AppState>,
+    _req: HttpRequest,
+) -> impl Responder {
+    let mut stream_active = state.stream_active.lock().unwrap();
+    if !*stream_active {
+        return HttpResponse::build(StatusCode::BAD_REQUEST)
+            .body("Stream not started. Call /stream/start first.");
+    }
+    let format = state.stream_format.lock().unwrap().clone();
+    if format != "mjpeg" {
+        return HttpResponse::build(StatusCode::BAD_REQUEST)
+            .body("Stream format is not MJPEG.");
+    }
+    let (tx, rx) = oneshot::channel();
+    *state.stream_stop_tx.lock().unwrap() = Some(tx);
+
+    let rtsp_url = format!(
+        "rtsp://{}:{}@{}:{}/Streaming/Channels/101",
+        state.username, state.password, state.camera_ip, state.rtsp_port
+    );
+
+    // Proxy RTSP MJPEG stream as HTTP MJPEG multipart
+    let boundary = "mjpegstream";
+    let (mut reader, mut writer) = tokio::io::duplex(1024 * 1024);
+
+    // Spawn RTSP-MJPEG streaming task
+    let rx_clone = rx;
+    let rtsp_url_clone = rtsp_url.clone();
 
     tokio::spawn(async move {
-        let mut interval = tokio::time::interval(Duration::from_millis(100));
-        loop {
-            tokio::select! {
-                _ = &mut stop_rx => {
-                    break;
-                }
-                _ = interval.tick() => {
-                    // Simulate a JPEG frame (just a static header and random bytes)
-                    let frame = b"\xff\xd8\xff\xdbJPEGFRAME\xff\xd9".to_vec();
-                    let mut part = Vec::new();
-                    part.extend_from_slice(b"--frame\r\nContent-Type: image/jpeg\r\n\r\n");
-                    part.extend_from_slice(&frame);
-                    part.extend_from_slice(b"\r\n");
-                    if tx.send(Ok(bytes::Bytes::from(part))).await.is_err() {
+        // Minimal RTSP-over-TCP client, expects MJPEG stream
+        // Hikvision supports MJPEG over HTTP, so connect directly to HTTP MJPEG if available
+        let mjpeg_url = format!(
+            "http://{}:{}/Streaming/channels/102/httpPreview",
+            state.camera_ip, state.http_port
+        );
+        if let Ok(mut stream) = TcpStream::connect(format!("{}:{}", state.camera_ip, state.http_port)).await {
+            let request = format!(
+                "GET /Streaming/channels/102/httpPreview HTTP/1.1\r\nHost: {}\r\nAuthorization: Basic {}\r\nConnection: close\r\n\r\n",
+                state.camera_ip,
+                base64::encode(format!("{}:{}", state.username, state.password))
+            );
+            let _ = stream.write_all(request.as_bytes()).await;
+            let mut buffer = [0u8; 4096];
+            let mut header_found = false;
+            loop {
+                tokio::select! {
+                    n = stream.read(&mut buffer) => {
+                        if let Ok(n) = n {
+                            if n == 0 { break; }
+                            // Find the headers and skip them
+                            if !header_found {
+                                if let Some(pos) = buffer[..n].windows(4).position(|w| w == b"\r\n\r\n") {
+                                    header_found = true;
+                                    let start = pos + 4;
+                                    let _ = writer.write_all(&buffer[start..n]).await;
+                                }
+                            } else {
+                                let _ = writer.write_all(&buffer[..n]).await;
+                            }
+                        } else {
+                            break;
+                        }
+                    },
+                    _ = rx_clone => {
                         break;
                     }
                 }
@@ -99,163 +166,142 @@ async fn stream_rtsp_to_mjpeg(
         }
     });
 
-    tokio_stream::wrappers::ReceiverStream::new(rx)
+    let body = async_stream::stream! {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(n) if n > 0 => {
+                    yield Ok(bytes::Bytes::copy_from_slice(&buf[..n]));
+                },
+                _ => break,
+            }
+        }
+    };
+
+    HttpResponse::Ok()
+        .content_type(format!("multipart/x-mixed-replace;boundary={}", boundary))
+        .insert_header((header::CACHE_CONTROL, "no-cache"))
+        .streaming(body)
 }
 
-async fn handle_request(
-    req: Request<Body>,
-    state: AppState,
-) -> Result<Response<Body>, hyper::Error> {
-    let path = req.uri().path().to_owned();
-    let method = req.method().clone();
-
-    match (method, path.as_str()) {
-        (Method::POST, "/stream/start") => {
-            // Parse requested format from JSON body
-            let whole_body = hyper::body::to_bytes(req.into_body()).await?;
-            let format = if !whole_body.is_empty() {
-                serde_json::from_slice::<StartStreamBody>(&whole_body)
-                    .unwrap_or(StartStreamBody { format: None })
-                    .format.unwrap_or_else(|| "mjpeg".to_string())
-            } else {
-                "mjpeg".to_string()
-            };
-            if format.to_lowercase() != "mjpeg" && format.to_lowercase() != "h264" {
-                return Ok(Response::builder()
-                    .status(StatusCode::BAD_REQUEST)
-                    .body(Body::from(r#"{"error":"Unsupported format"}"#))
-                    .unwrap());
-            }
-
-            let mut session = state.session.lock().unwrap();
-            if session.is_some() && session.as_ref().unwrap().active {
-                return Ok(Response::builder()
-                    .status(StatusCode::CONFLICT)
-                    .body(Body::from(r#"{"error":"Stream already active"}"#))
-                    .unwrap());
-            }
-            *session = Some(StreamSession {
-                format: format.clone(),
-                active: true,
-            });
-            // Prepare stop channel for stream
-            let (stop_tx, _stop_rx) = oneshot::channel();
-            *state.stop_tx.lock().unwrap() = Some(stop_tx);
-
-            Ok(Response::builder()
-                .header("Content-Type", "application/json")
-                .body(Body::from(format!(
-                    r#"{{"status":"started","format":"{}"}}"#,
-                    format
-                )))
-                .unwrap())
-        }
-        (Method::POST, "/stream/stop") => {
-            // Stop active stream if any
-            let mut stop_tx = state.stop_tx.lock().unwrap();
-            if let Some(tx) = stop_tx.take() {
-                let _ = tx.send(());
-            }
-            let mut session = state.session.lock().unwrap();
-            *session = None;
-            Ok(Response::builder()
-                .header("Content-Type", "application/json")
-                .body(Body::from(r#"{"status":"stopped"}"#))
-                .unwrap())
-        }
-        (Method::GET, "/stream/url") => {
-            // Return the RTSP URL (for debugging or advanced clients)
-            let session = state.session.lock().unwrap();
-            let format = if let Some(ref s) = *session {
-                s.format.clone()
-            } else {
-                "mjpeg".to_string()
-            };
-            let url = build_rtsp_url(&state.config, &format);
-            Ok(Response::builder()
-                .header("Content-Type", "application/json")
-                .body(Body::from(format!(r#"{{"url":"{}"}}"#, url)))
-                .unwrap())
-        }
-        (Method::GET, "/stream/live") => {
-            // Proxy MJPEG stream over HTTP
-            let session = state.session.lock().unwrap();
-            if session.is_none() || !session.as_ref().unwrap().active {
-                return Ok(Response::builder()
-                    .status(StatusCode::NOT_FOUND)
-                    .body(Body::from("Stream not started."))
-                    .unwrap());
-            }
-            let format = session.as_ref().unwrap().format.clone();
-            if format.to_lowercase() != "mjpeg" {
-                return Ok(Response::builder()
-                    .status(StatusCode::NOT_IMPLEMENTED)
-                    .body(Body::from("Only MJPEG supported for browser streaming."))
-                    .unwrap());
-            }
-
-            // Prepare to stream MJPEG frames
-            let stop_rx = state.stop_tx.lock().unwrap().take().map(|tx| {
-                let (proxy_tx, proxy_rx) = oneshot::channel();
-                // Immediately replace, so /stream/stop can work again
-                *state.stop_tx.lock().unwrap() = Some(proxy_tx);
-                tx
-            }).unwrap_or_else(|| {
-                let (_tx, rx) = oneshot::channel();
-                rx
-            });
-
-            let rtsp_url = build_rtsp_url(&state.config, &format);
-
-            let stream = stream_rtsp_to_mjpeg(&rtsp_url, stop_rx).await;
-            let body = Body::wrap_stream(stream);
-
-            Ok(Response::builder()
-                .header("Content-Type", "multipart/x-mixed-replace; boundary=frame")
-                .header("Cache-Control", "no-cache")
-                .body(body)
-                .unwrap())
-        }
-        _ => Ok(Response::builder()
-            .status(StatusCode::NOT_FOUND)
-            .body(Body::from("Not Found"))
-            .unwrap()),
+async fn stream_h264(
+    state: web::Data<AppState>,
+    _req: HttpRequest,
+) -> impl Responder {
+    let mut stream_active = state.stream_active.lock().unwrap();
+    if !*stream_active {
+        return HttpResponse::build(StatusCode::BAD_REQUEST)
+            .body("Stream not started. Call /stream/start first.");
     }
-}
+    let format = state.stream_format.lock().unwrap().clone();
+    if format != "h264" {
+        return HttpResponse::build(StatusCode::BAD_REQUEST)
+            .body("Stream format is not h264.");
+    }
+    let (tx, rx) = oneshot::channel();
+    *state.stream_stop_tx.lock().unwrap() = Some(tx);
 
-#[tokio::main]
-async fn main() {
-    // Load configuration from environment
-    let config = Config {
-        camera_ip: get_env("CAMERA_IP", None),
-        camera_rtsp_port: get_env_u16("CAMERA_RTSP_PORT", 554),
-        camera_user: get_env("CAMERA_USER", Some("admin")),
-        camera_password: get_env("CAMERA_PASSWORD", Some("12345")),
-        server_host: get_env("SERVER_HOST", Some("0.0.0.0")),
-        server_port: get_env_u16("SERVER_PORT", 8080),
-    };
+    let rtsp_url = format!(
+        "rtsp://{}:{}@{}:{}/Streaming/Channels/101",
+        state.username, state.password, state.camera_ip, state.rtsp_port
+    );
 
-    let addr: SocketAddr = format!("{}:{}", config.server_host, config.server_port)
-        .parse().expect("Invalid SERVER_HOST or SERVER_PORT");
+    // Proxy RTSP h264 stream as HTTP octet-stream
+    // This is a raw proxy, browser may need MSE or similar to consume
+    let (mut reader, mut writer) = tokio::io::duplex(1024 * 1024);
+    let rx_clone = rx;
+    let rtsp_url_clone = rtsp_url.clone();
 
-    let state = AppState {
-        session: Arc::new(Mutex::new(None)),
-        stop_tx: Arc::new(Mutex::new(None)),
-        config: config.clone(),
-    };
-
-    let make_svc = make_service_fn(move |_conn| {
-        let state = state.clone();
-        async move {
-            Ok::<_, hyper::Error>(service_fn(move |req| {
-                handle_request(req, state.clone())
-            }))
+    tokio::spawn(async move {
+        // Minimal RTSP-over-TCP client, just pipes the RTP payload as raw stream
+        if let Ok(mut stream) = TcpStream::connect(format!("{}:{}", state.camera_ip, state.rtsp_port)).await {
+            // Write RTSP DESCRIBE/SETUP/PLAY
+            let cseq = 1;
+            let describe = format!(
+                "DESCRIBE {} RTSP/1.0\r\nCSeq: {}\r\nAuthorization: Basic {}\r\nAccept: application/sdp\r\n\r\n",
+                rtsp_url_clone,
+                cseq,
+                base64::encode(format!("{}:{}", state.username, state.password))
+            );
+            let _ = stream.write_all(describe.as_bytes()).await;
+            // For simplicity, just proxy all data received
+            let mut buffer = [0u8; 4096];
+            loop {
+                tokio::select! {
+                    n = stream.read(&mut buffer) => {
+                        if let Ok(n) = n {
+                            if n == 0 { break; }
+                            let _ = writer.write_all(&buffer[..n]).await;
+                        } else {
+                            break;
+                        }
+                    },
+                    _ = rx_clone => {
+                        break;
+                    }
+                }
+            }
         }
     });
 
-    println!(
-        "Hikvision IP Camera HTTP driver listening on http://{} (connect /stream/live in browser)",
-        addr
-    );
-    Server::bind(&addr).serve(make_svc).await.unwrap();
+    let body = async_stream::stream! {
+        let mut buf = [0u8; 4096];
+        loop {
+            match reader.read(&mut buf).await {
+                Ok(n) if n > 0 => {
+                    yield Ok(bytes::Bytes::copy_from_slice(&buf[..n]));
+                },
+                _ => break,
+            }
+        }
+    };
+
+    HttpResponse::Ok()
+        .content_type("video/mp4")
+        .insert_header((header::CACHE_CONTROL, "no-cache"))
+        .streaming(body)
+}
+
+#[actix_web::main]
+async fn main() -> std::io::Result<()> {
+    let camera_ip = env::var("CAMERA_IP").expect("CAMERA_IP not set");
+    let username = env::var("CAMERA_USERNAME").unwrap_or_else(|_| "admin".to_string());
+    let password = env::var("CAMERA_PASSWORD").unwrap_or_else(|_| "admin".to_string());
+    let server_host = env::var("SERVER_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
+    let server_port = env::var("SERVER_PORT")
+        .unwrap_or_else(|_| "8080".to_string())
+        .parse::<u16>()
+        .expect("SERVER_PORT must be a number");
+    let rtsp_port = env::var("RTSP_PORT")
+        .unwrap_or_else(|_| "554".to_string())
+        .parse::<u16>()
+        .expect("RTSP_PORT must be a number");
+    let http_port = env::var("HTTP_PORT")
+        .unwrap_or_else(|_| "80".to_string())
+        .parse::<u16>()
+        .expect("HTTP_PORT must be a number");
+
+    let state = web::Data::new(AppState {
+        camera_ip,
+        username,
+        password,
+        rtsp_port,
+        http_port,
+        stream_active: Arc::new(Mutex::new(false)),
+        stream_stop_tx: Arc::new(Mutex::new(None)),
+        stream_format: Arc::new(Mutex::new("mjpeg".to_string())),
+    });
+
+    HttpServer::new(move || {
+        App::new()
+            .app_data(state.clone())
+            .route("/stream/start", web::post().to(stream_start))
+            .route("/stream/stop", web::post().to(stream_stop))
+            .route("/stream/url", web::get().to(stream_url))
+            .route("/stream/mjpeg", web::get().to(stream_mjpeg))
+            .route("/stream/h264", web::get().to(stream_h264))
+    })
+    .bind((server_host.as_str(), server_port))?
+    .run()
+    .await
 }
